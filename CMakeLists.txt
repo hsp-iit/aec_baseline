@@ -63,6 +63,10 @@ add_executable(aecComponent
     AECComponent.hpp
     AECComponent.cpp
     aec_main.cpp
+    referenceReader.hpp
+    referenceReader.cpp
+    delayEstimator.hpp
+    delayEstimator.cpp
 )
 
 # Link libraries

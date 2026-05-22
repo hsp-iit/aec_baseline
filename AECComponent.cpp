@@ -51,6 +51,8 @@ AECComponent::AECComponent()
             m_aecFramesWithoutReference(0),
             m_lastAecStatsLog(std::chrono::steady_clock::now())
 {
+    // m_referenceReader = ReferenceReader();
+    m_delayEstimator = DelayEstimator();
 }
 
 AECComponent::~AECComponent()
@@ -64,21 +66,21 @@ bool AECComponent::configure(yarp::os::ResourceFinder &rf)
 
     // Parse configuration
     bool okCheck = rf.check("AEC_COMPONENT");
-    std::string referenceInputPortName = "/aecComponent/reference:i";
     std::string microphoneInputPortName = "/aecComponent/microphone:i";
+    std::string referenceInputPortName = "/aecComponent/reference:i";
     std::string audioOutputPortName = "/aecComponent/audio:o";
 
     if (okCheck)
     {
         yarp::os::Searchable &aecConfig = rf.findGroup("AEC_COMPONENT");
         
-        if (aecConfig.check("referenceInputPort"))
-        {
-            referenceInputPortName = aecConfig.find("referenceInputPort").asString();
-        }
         if (aecConfig.check("microphoneInputPort"))
         {
             microphoneInputPortName = aecConfig.find("microphoneInputPort").asString();
+        }
+        if (aecConfig.check("referenceInputPort"))
+        {
+            referenceInputPortName = aecConfig.find("referenceInputPort").asString();
         }
         if (aecConfig.check("audioOutputPort"))
         {
@@ -158,14 +160,6 @@ bool AECComponent::configure(yarp::os::ResourceFinder &rf)
         return false;
     }
 
-    // Open input ports - Reference signal (speaker output)
-    if (!m_referenceAudioInputPort.open(referenceInputPortName))
-    {
-        yError() << "[AECComponent::configure] Unable to open reference audio input port: " << referenceInputPortName;
-        return false;
-    }
-    yInfo() << "[AECComponent::configure] Reference audio input port opened: " << referenceInputPortName;
-
     // Open input ports - Microphone
     if (!m_microphoneAudioInputPort.open(microphoneInputPortName))
     {
@@ -173,6 +167,14 @@ bool AECComponent::configure(yarp::os::ResourceFinder &rf)
         return false;
     }
     yInfo() << "[AECComponent::configure] Microphone audio input port opened: " << microphoneInputPortName;
+
+    // Open reference reader port via ReferenceReader
+    if (!m_referenceReader.open(referenceInputPortName))
+    {
+        yError() << "[AECComponent::configure] Unable to open reference input port: " << referenceInputPortName;
+        return false;
+    }
+    yInfo() << "[AECComponent::configure] Reference input opened: " << referenceInputPortName;
 
     // Open output port
     if (!m_audioOutputPort.open(audioOutputPortName))
@@ -252,11 +254,57 @@ void AECComponent::processingThreadFunction()
 
     while (!m_shouldExit)
     {
+        yInfo() << "[AECComponent::processingThread] Waiting for speaker audio input...";
         // Read reference audio (speaker output)
-        yarp::sig::Sound *referenceAudio = m_referenceAudioInputPort.read(false);
+        yarp::sig::Sound referenceAudio = m_referenceReader.getRecordedReferenceBlocks();
+
+        yInfo() << "[AECComponent::processingThread] Retrieved reference audio with" << referenceAudio.getSamples() << "samples at" << referenceAudio.getFrequency() << "Hz";
+        yInfo() << "[AECComponent::processingThread] Waiting for microphone audio input...";
         
         // Read microphone audio (blocking): this paces the processing loop and reduces busy-spin jitter.
         yarp::sig::Sound *microphoneAudio = m_microphoneAudioInputPort.read(true);
+
+        yInfo() << "[AECComponent::processingThread] Received microphone audio with" << (microphoneAudio ? microphoneAudio->getSamples() : 0) << "samples at" << (microphoneAudio ? microphoneAudio->getFrequency() : 0) << "Hz";
+
+        std::vector<short> micSamples;
+        for (int i = 0; i < static_cast<int>(microphoneAudio->getSamples()); ++i)
+        {
+            micSamples.push_back(microphoneAudio->get(i, 0));
+        }
+        yInfo() << "[AECComponent::processingThread] Extracted microphone samples into vector, size:" << micSamples.size();
+        std::vector<short> referenceSamples;
+        for (int i = 0; i < static_cast<int>(referenceAudio.getSamples()); ++i)
+        {
+            referenceSamples.push_back(referenceAudio.get(i, 0));
+        }
+        yInfo() << "[AECComponent::processingThread] Extracted reference samples into vector, size:" << referenceSamples.size();
+
+        m_delayEstimator.update(micSamples, microphoneAudio->getFrequency(), referenceSamples, referenceAudio.getFrequency());
+
+        yInfo() << "[AECComponent::processingThread] Updated delay estimator with new audio data";
+
+        int estimatedDelay = m_delayEstimator.estimatedDelaySamples();
+
+        yInfo() << "[AECComponent::processingThread] Estimated delay in samples:" << estimatedDelay;
+        double delayConfidence = m_delayEstimator.confidence();
+
+        yInfo() << "[AECComponent::processingThread] Delay confidence:" << delayConfidence;
+
+        yarp::sig::Sound referenceBlockForMic = m_referenceReader.getReferenceBlock(estimatedDelay, microphoneAudio->getSamples());
+
+        yInfo() << "[AECComponent::processingThread] Retrieved reference block for mic with" << referenceBlockForMic.getSamples() << "samples at" << referenceBlockForMic.getFrequency() << "Hz";
+
+        if (delayConfidence >= m_delayEstimator.confidenceThreshold())
+        {
+            yInfo() << "[AECComponent::processingThread] Estimated delay:" << estimatedDelay << "samples, confidence:" << delayConfidence;
+            // Flush old reference blocks that are outside the estimated delay window to prevent them from being used in future processing iterations.
+            m_referenceReader.flushStaledBlocks(estimatedDelay);
+        }
+        else
+        {
+            yInfo() << "[AECComponent::processingThread] Delay confidence below threshold:" << delayConfidence;
+        }
+
         // Append incoming samples to internal buffers
         if (microphoneAudio)
         {
@@ -286,15 +334,16 @@ void AECComponent::processingThreadFunction()
             {
                 m_micBuffer.push_back(microphoneAudio->get(i, 0));
             }
+            yInfo() << "[AECComponent::processingThread] Added" << mic_samples << "mic samples to buffer. Buffer size is now" << m_micBuffer.size();
         }
-        if (referenceAudio)
+        if (referenceBlockForMic.getSamples() > 0)
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            int ref_samples = static_cast<int>(referenceAudio->getSamples());
+            int ref_samples = static_cast<int>(referenceBlockForMic.getSamples());
             for (int i = 0; i < ref_samples; ++i)
             {
-                m_refBuffer.push_back(referenceAudio->get(i, 0));
+                m_refBuffer.push_back(referenceBlockForMic.get(i, 0));
             }
+            yInfo() << "[AECComponent::processingThread] Added" << ref_samples << "ref samples to buffer. Buffer size is now" << m_refBuffer.size();
         }
 
         // Frame size in samples (e.g., 48 kHz, 10 ms -> 480)
@@ -445,8 +494,9 @@ bool AECComponent::close()
     {
         m_processingThread.join();
     }
+    // Close the reference reader first to stop its internal thread and release the port
+    m_referenceReader.close();
 
-    m_referenceAudioInputPort.close();
     m_microphoneAudioInputPort.close();
     m_audioOutputPort.close();
 

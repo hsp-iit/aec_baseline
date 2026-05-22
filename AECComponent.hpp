@@ -25,6 +25,9 @@
 #include "modules/audio_processing/include/audio_processing.h"
 #include <deque>
 
+#include "referenceReader.hpp"
+#include "delayEstimator.hpp"
+
 class AECComponent : public yarp::os::RFModule,
                      public yarp::os::TypedReaderCallback<yarp::sig::Sound>
 {
@@ -41,7 +44,6 @@ public:
 
 private:
     // YARP network and ports
-    yarp::os::BufferedPort<yarp::sig::Sound> m_referenceAudioInputPort;  // Speaker output (reference)
     yarp::os::BufferedPort<yarp::sig::Sound> m_microphoneAudioInputPort;  // Microphone input
     yarp::os::BufferedPort<yarp::sig::Sound> m_audioOutputPort;           // Echo-canceled output
 
@@ -85,6 +87,11 @@ private:
     std::size_t m_aecFramesWithReference;
     std::size_t m_aecFramesWithoutReference;
     std::chrono::steady_clock::time_point m_lastAecStatsLog;
+
+    ReferenceReader m_referenceReader;
+    DelayEstimator m_delayEstimator;
+
+
 };
 
 #endif // AEC_COMPONENT__HPP
