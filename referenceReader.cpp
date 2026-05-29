@@ -215,13 +215,19 @@ yarp::sig::Sound ReferenceReader::getReferenceBlock(int index, int size)
     }
 
     // TODO: change vector of reference blocks to single contiguous buffer to avoid this concatenation and allow more efficient retrieval of reference segments by index and size.
-    const ReferenceBlock &block = allSamples[index];
+    
+    std::vector<short>::const_iterator first = allSamples.begin() + index;
+    std::vector<short>::const_iterator last = allSamples.begin() + index + std::max(static_cast<int>(allSamples.size()), size);
+    std::vector<short> refBlock(first, last);
+    
+    // const ReferenceBlock &block = allSamples[index];
     yarp::sig::Sound sound;
-    sound.resize(std::max(m_qu, size), 1);
-    for (int i = 0; i < size && i < static_cast<int>(block.samples.size()); ++i)
+    sound.resize(refBlock.size(), 1);
+    for (int i = 0; i < size && i < static_cast<int>(refBlock.size()); ++i)
     {
-        sound.set(i, 0, block.samples[i]);
+        sound.set(i, 0, refBlock[i]);
     }
+    sound.setFrequency(m_queue.empty() ? 0 : m_queue.front().sampleRate);
     return sound;
 }
 

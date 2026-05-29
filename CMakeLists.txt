@@ -69,14 +69,28 @@ add_executable(aecComponent
     delayEstimator.cpp
 )
 
+add_executable(microphoneRecorder
+    MicrophoneReader.hpp
+    MicrophoneReader.cpp
+    microphoneRecorder_main.cpp
+)
+
 # Link libraries
 target_link_libraries(aecComponent
     ${YARP_LIBRARIES}
     PkgConfig::WAP
 )
 
+target_link_libraries(microphoneRecorder
+    ${YARP_LIBRARIES}
+)
+
 # Include directories
 target_include_directories(aecComponent PRIVATE
+    ${YARP_INCLUDE_DIRS}
+)
+
+target_include_directories(microphoneRecorder PRIVATE
     ${YARP_INCLUDE_DIRS}
 )
 
@@ -88,8 +102,10 @@ endif()
 # Compiler flags
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(aecComponent PRIVATE -Wall -Wextra -std=c++17)
+    target_compile_options(microphoneRecorder PRIVATE -Wall -Wextra -std=c++17)
 endif()
 
 # Installation
 install(TARGETS aecComponent DESTINATION bin)
+install(TARGETS microphoneRecorder DESTINATION bin)
 install(FILES aec_config.ini DESTINATION share/aec)
