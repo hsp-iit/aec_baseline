@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <cmath>
 #include <sstream>
 #include <vector>
 #include <algorithm>
@@ -17,6 +18,66 @@
 
 namespace
 {
+std::vector<short> resampleLinear(const std::vector<short> &inputSamples,
+                                  int inputSampleRate,
+                                  int outputSampleRate)
+{
+    if (inputSamples.empty() || inputSampleRate <= 0 || outputSampleRate <= 0 || inputSampleRate == outputSampleRate)
+    {
+        return inputSamples;
+    }
+
+    const double ratio = static_cast<double>(outputSampleRate) / static_cast<double>(inputSampleRate);
+    const std::size_t outputSize = std::max<std::size_t>(1, static_cast<std::size_t>(std::llround(inputSamples.size() * ratio)));
+    std::vector<short> outputSamples(outputSize);
+
+    for (std::size_t index = 0; index < outputSize; ++index)
+    {
+        const double sourcePosition = static_cast<double>(index) / ratio;
+        const std::size_t leftIndex = static_cast<std::size_t>(std::floor(sourcePosition));
+        const std::size_t rightIndex = std::min(leftIndex + 1, inputSamples.size() - 1);
+        const double fraction = sourcePosition - static_cast<double>(leftIndex);
+
+        const double leftSample = static_cast<double>(inputSamples[leftIndex]);
+        const double rightSample = static_cast<double>(inputSamples[rightIndex]);
+        const double interpolatedSample = leftSample + (rightSample - leftSample) * fraction;
+        outputSamples[index] = static_cast<short>(std::lround(interpolatedSample));
+    }
+
+    return outputSamples;
+}
+
+void appendSamples(std::deque<short> &buffer, const std::vector<short> &samples)
+{
+    for (short sample : samples)
+    {
+        buffer.push_back(sample);
+    }
+}
+
+std::vector<short> takeTailSamples(const std::deque<short> &buffer, std::size_t sampleCount)
+{
+    if (buffer.empty() || sampleCount == 0)
+    {
+        return {};
+    }
+
+    const std::size_t beginOffset = buffer.size() > sampleCount ? buffer.size() - sampleCount : 0;
+    std::vector<short> samples;
+    samples.reserve(buffer.size() - beginOffset);
+
+    std::size_t index = 0;
+    for (short sample : buffer)
+    {
+        if (index++ >= beginOffset)
+        {
+            samples.push_back(sample);
+        }
+    }
+
+    return samples;
+}
+
 void writeLittleEndian16(std::ostream &stream, std::uint16_t value)
 {
     stream.put(static_cast<char>(value & 0xff));
@@ -254,15 +315,17 @@ void AECComponent::processingThreadFunction()
 
     while (!m_shouldExit)
     {
-        yInfo() << "[AECComponent::processingThread] Waiting for speaker audio input...";
-        // Read reference audio (speaker output)
-        yarp::sig::Sound referenceAudio = m_referenceReader.getRecordedReferenceBlocks();
-
-        yInfo() << "[AECComponent::processingThread] Retrieved reference audio with" << referenceAudio.getSamples() << "samples at" << referenceAudio.getFrequency() << "Hz";
         yInfo() << "[AECComponent::processingThread] Waiting for microphone audio input...";
-        
-        // Read microphone audio (blocking): this paces the processing loop and reduces busy-spin jitter.
         yarp::sig::Sound *microphoneAudio = m_microphoneAudioInputPort.read(true);
+
+        if (!microphoneAudio)
+        {
+            if (m_shouldExit)
+            {
+                break;
+            }
+            continue;
+        }
 
         yInfo() << "[AECComponent::processingThread] Received microphone audio with" << (microphoneAudio ? microphoneAudio->getSamples() : 0) << "samples at" << (microphoneAudio ? microphoneAudio->getFrequency() : 0) << "Hz";
 
@@ -272,84 +335,80 @@ void AECComponent::processingThreadFunction()
             micSamples.push_back(microphoneAudio->get(i, 0));
         }
         yInfo() << "[AECComponent::processingThread] Extracted microphone samples into vector, size:" << micSamples.size();
-        std::vector<short> referenceSamples;
-        for (int i = 0; i < static_cast<int>(referenceAudio.getSamples()); ++i)
+        m_lastMicBlockSamples = static_cast<int>(micSamples.size());
+        int micFrequency = microphoneAudio->getFrequency();
+        if (micFrequency > 0 && micFrequency != m_sample_rate)
         {
-            referenceSamples.push_back(referenceAudio.get(i, 0));
+            yInfo() << "[AECComponent::processingThread] Detected mic frequency" << micFrequency << "Hz, reinitializing AEC";
+            if (m_streamConfig)
+            {
+                delete m_streamConfig;
+                m_streamConfig = nullptr;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_micBuffer.clear();
+                m_refBuffer.clear();
+                m_outBuffer.clear();
+                m_audioSaveBuffer.clear();
+            }
+
+            m_sample_rate = micFrequency;
+            if (!initializeAEC(m_sample_rate, m_num_channels))
+            {
+                yError() << "[AECComponent::processingThread] Failed to reinitialize AEC with new sample rate";
+            }
         }
-        yInfo() << "[AECComponent::processingThread] Extracted reference samples into vector, size:" << referenceSamples.size();
 
-        m_delayEstimator.update(micSamples, microphoneAudio->getFrequency(), referenceSamples, referenceAudio.getFrequency());
-
-        yInfo() << "[AECComponent::processingThread] Updated delay estimator with new audio data";
-
-        int estimatedDelay = m_delayEstimator.estimatedDelaySamples();
-
-        yInfo() << "[AECComponent::processingThread] Estimated delay in samples:" << estimatedDelay;
-        double delayConfidence = m_delayEstimator.confidence();
-
-        yInfo() << "[AECComponent::processingThread] Delay confidence:" << delayConfidence;
-
-        yarp::sig::Sound referenceBlockForMic = m_referenceReader.getReferenceBlock(estimatedDelay, microphoneAudio->getSamples());
-
-        yInfo() << "[AECComponent::processingThread] Retrieved reference block for mic with" << referenceBlockForMic.getSamples() << "samples at" << referenceBlockForMic.getFrequency() << "Hz";
-
-        if (delayConfidence >= m_delayEstimator.confidenceThreshold())
+        std::vector<short> referenceSamples;
+        int referenceSampleRate = 0;
+        while (m_referenceReader.tryPopBlock(referenceSamples, referenceSampleRate))
         {
-            yInfo() << "[AECComponent::processingThread] Estimated delay:" << estimatedDelay << "samples, confidence:" << delayConfidence;
-            // Flush old reference blocks that are outside the estimated delay window to prevent them from being used in future processing iterations.
-            m_referenceReader.flushStaledBlocks(estimatedDelay);
+            if (referenceSampleRate > 0 && referenceSampleRate != m_sample_rate)
+            {
+                referenceSamples = resampleLinear(referenceSamples, referenceSampleRate, m_sample_rate);
+                referenceSampleRate = m_sample_rate;
+            }
+
+            std::lock_guard<std::mutex> lock(m_mutex);
+            appendSamples(m_refBuffer, referenceSamples);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            appendSamples(m_micBuffer, micSamples);
+        }
+
+        const int frame_samples = std::max(1, static_cast<int>((m_sample_rate * m_block_ms) / 1000));
+        const std::size_t lagWindowSamples = std::max<std::size_t>(static_cast<std::size_t>(frame_samples) * 8, static_cast<std::size_t>(m_sample_rate));
+
+        std::vector<short> micWindow;
+        std::vector<short> refWindow;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            micWindow = takeTailSamples(m_micBuffer, lagWindowSamples);
+            refWindow = takeTailSamples(m_refBuffer, lagWindowSamples);
+        }
+
+        if (!micWindow.empty() && !refWindow.empty())
+        {
+            m_delayEstimator.update(micWindow, m_sample_rate, refWindow, m_sample_rate);
+        }
+
+        const int estimatedDelaySamples = m_delayEstimator.estimatedDelaySamples();
+        const double delayConfidence = m_delayEstimator.confidence();
+        int activeStreamDelayMs = m_aecStreamDelayMs;
+        if (delayConfidence >= m_delayEstimator.confidenceThreshold() && m_sample_rate > 0)
+        {
+            activeStreamDelayMs = std::max(0, static_cast<int>(std::lround(1000.0 * static_cast<double>(estimatedDelaySamples) / static_cast<double>(m_sample_rate))));
+            yInfo() << "[AECComponent::processingThread] Estimated delay:" << estimatedDelaySamples << "samples, confidence:" << delayConfidence;
         }
         else
         {
             yInfo() << "[AECComponent::processingThread] Delay confidence below threshold:" << delayConfidence;
         }
 
-        // Append incoming samples to internal buffers
-        if (microphoneAudio)
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            int mic_samples = static_cast<int>(microphoneAudio->getSamples());
-            // remember last incoming mic block size so we can emit matching blocks
-            m_lastMicBlockSamples = mic_samples;
-            // Auto-detect input frequency and reinitialize AEC if it differs
-            int mic_freq = microphoneAudio->getFrequency();
-            if (mic_freq > 0 && mic_freq != m_sample_rate)
-            {
-                yInfo() << "[AECComponent::processingThread] Detected mic frequency" << mic_freq << "Hz, reinitializing AEC";
-                // reset stream config and reinitialize AEC for new sample rate
-                if (m_streamConfig)
-                {
-                    delete m_streamConfig;
-                    m_streamConfig = nullptr;
-                }
-                m_sample_rate = mic_freq;
-                // reinitialize AEC with new sample rate
-                if (!initializeAEC(m_sample_rate, m_num_channels))
-                {
-                    yError() << "[AECComponent::processingThread] Failed to reinitialize AEC with new sample rate";
-                }
-            }
-            for (int i = 0; i < mic_samples; ++i)
-            {
-                m_micBuffer.push_back(microphoneAudio->get(i, 0));
-            }
-            yInfo() << "[AECComponent::processingThread] Added" << mic_samples << "mic samples to buffer. Buffer size is now" << m_micBuffer.size();
-        }
-        if (referenceBlockForMic.getSamples() > 0)
-        {
-            int ref_samples = static_cast<int>(referenceBlockForMic.getSamples());
-            for (int i = 0; i < ref_samples; ++i)
-            {
-                m_refBuffer.push_back(referenceBlockForMic.get(i, 0));
-            }
-            yInfo() << "[AECComponent::processingThread] Added" << ref_samples << "ref samples to buffer. Buffer size is now" << m_refBuffer.size();
-        }
-
-        // Frame size in samples (e.g., 48 kHz, 10 ms -> 480)
-        const int frame_samples = static_cast<int>((m_sample_rate * m_block_ms) / 1000);
-
-        // Process as many full frames as available in mic buffer
         while (true)
         {
             std::vector<short> mic_frame;
@@ -389,7 +448,7 @@ void AECComponent::processingThreadFunction()
 
             try
             {
-                m_apm->set_stream_delay_ms(m_aecStreamDelayMs);
+                m_apm->set_stream_delay_ms(activeStreamDelayMs);
                 m_apm->ProcessReverseStream(ref_frame.data(), *m_streamConfig, *m_streamConfig, ref_frame.data());
                 m_apm->ProcessStream(mic_frame.data(), *m_streamConfig, *m_streamConfig, mic_frame.data());
                 if (hadReferenceData)
@@ -430,7 +489,6 @@ void AECComponent::processingThreadFunction()
             }
         }
 
-        // Emit aggregated output blocks matching last incoming mic block size
         if (m_lastMicBlockSamples > 0)
         {
             while (true)
@@ -490,14 +548,13 @@ bool AECComponent::close()
 
     m_shouldExit = true;
 
+    m_microphoneAudioInputPort.close();
+    m_referenceReader.close();
+
     if (m_processingThread.joinable())
     {
         m_processingThread.join();
     }
-    // Close the reference reader first to stop its internal thread and release the port
-    m_referenceReader.close();
-
-    m_microphoneAudioInputPort.close();
     m_audioOutputPort.close();
 
     if (m_streamConfig)

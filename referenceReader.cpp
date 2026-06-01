@@ -7,8 +7,6 @@
 
 #include "referenceReader.hpp"
 
-#include <algorithm>
-
 #include <yarp/os/LogStream.h>
 
 ReferenceReader::ReferenceReader()
@@ -131,64 +129,25 @@ void ReferenceReader::readerThreadFunction()
     }
 }
 
-std::vector<short> resampleLinear(const std::vector<short> &inputSamples,
-                                  int inputSampleRate,
-                                  int outputSampleRate)
-{
-    if (inputSamples.empty() || inputSampleRate <= 0 || outputSampleRate <= 0 || inputSampleRate == outputSampleRate)
-    {
-        return inputSamples;
-    }
-
-    const double ratio = static_cast<double>(outputSampleRate) / static_cast<double>(inputSampleRate);
-    const std::size_t outputSize = std::max<std::size_t>(1, static_cast<std::size_t>(std::llround(inputSamples.size() * ratio)));
-    std::vector<short> outputSamples(outputSize);
-
-    for (std::size_t index = 0; index < outputSize; ++index)
-    {
-        const double sourcePosition = static_cast<double>(index) / ratio;
-        const std::size_t leftIndex = static_cast<std::size_t>(std::floor(sourcePosition));
-        const std::size_t rightIndex = std::min(leftIndex + 1, inputSamples.size() - 1);
-        const double fraction = sourcePosition - static_cast<double>(leftIndex);
-
-        const double leftSample = static_cast<double>(inputSamples[leftIndex]);
-        const double rightSample = static_cast<double>(inputSamples[rightIndex]);
-        const double interpolatedSample = leftSample + (rightSample - leftSample) * fraction;
-        outputSamples[index] = static_cast<short>(std::lround(interpolatedSample));
-    }
-
-    return outputSamples;
-}
-
 void ReferenceReader::enqueueBlock(const yarp::sig::Sound &sound)
 {
-
-    std::vector<short> resampledSamples;
     std::vector<short> inputSamples;
     inputSamples.reserve(static_cast<std::size_t>(sound.getSamples()));
     for (int index = 0; index < static_cast<int>(sound.getSamples()); ++index)
-    {        inputSamples.push_back(sound.get(index, 0));
-    }
-
-    int inputSampleRate = sound.getFrequency();
-    int outputSampleRate = 16000; // AEC expects 16kHz reference
-    if (inputSampleRate != outputSampleRate)
     {
-        resampledSamples = resampleLinear(inputSamples, inputSampleRate, outputSampleRate);
-    }
-    else
-    {   resampledSamples = inputSamples;
+        inputSamples.push_back(sound.get(index, 0));
     }
 
-    // Copy samples out of the YARP Sound and store them in the internal queue.
+    // Keep the incoming block at its native rate so the component thread can
+    // align it to the microphone stream in real time.
     ReferenceBlock block;
-    block.sampleRate = outputSampleRate;
-    const int sampleCount = static_cast<int>(resampledSamples.size());
+    block.sampleRate = sound.getFrequency();
+    const int sampleCount = static_cast<int>(inputSamples.size());
     block.samples.reserve(std::max(0, sampleCount));
 
     for (int index = 0; index < sampleCount; ++index)
-    {   
-        block.samples.push_back(resampledSamples[index]);
+    {
+        block.samples.push_back(inputSamples[index]);
     }
 
     yInfo() << "[ReferenceReader::enqueueBlock] Enqueued reference block with" << block.samples.size() << "samples at" << block.sampleRate << "Hz";
@@ -201,33 +160,33 @@ void ReferenceReader::enqueueBlock(const yarp::sig::Sound &sound)
 
 yarp::sig::Sound ReferenceReader::getReferenceBlock(int index, int size)
 {
-    // Get a specific reference block by index and size.
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (index < 0 || index >= static_cast<int>(m_queue.size()))
+    if (index < 0 || size <= 0)
     {
         return yarp::sig::Sound();
     }
 
-    // concatenate all blocks into a single vector of shorts
     std::vector<short> allSamples;
     for (const ReferenceBlock &block : m_queue)
-    {        allSamples.insert(allSamples.end(), block.samples.begin(), block.samples.end());
+    {
+        allSamples.insert(allSamples.end(), block.samples.begin(), block.samples.end());
     }
 
-    // TODO: change vector of reference blocks to single contiguous buffer to avoid this concatenation and allow more efficient retrieval of reference segments by index and size.
-    
-    std::vector<short>::const_iterator first = allSamples.begin() + index;
-    std::vector<short>::const_iterator last = allSamples.begin() + index + std::max(static_cast<int>(allSamples.size()), size);
-    std::vector<short> refBlock(first, last);
-    
-    // const ReferenceBlock &block = allSamples[index];
+    if (index >= static_cast<int>(allSamples.size()))
+    {
+        return yarp::sig::Sound();
+    }
+
+    const int endIndex = std::min(index + size, static_cast<int>(allSamples.size()));
+    std::vector<short> refBlock(allSamples.begin() + index, allSamples.begin() + endIndex);
+
     yarp::sig::Sound sound;
     sound.resize(refBlock.size(), 1);
-    for (int i = 0; i < size && i < static_cast<int>(refBlock.size()); ++i)
+    for (int i = 0; i < static_cast<int>(refBlock.size()); ++i)
     {
-        sound.set(i, 0, refBlock[i]);
+        sound.set(refBlock[i], i, 0);
     }
-    sound.setFrequency(m_queue.empty() ? 0 : m_queue.front().sampleRate);
+    sound.setFrequency(m_queue.empty() ? 0 : m_queue.back().sampleRate);
     return sound;
 }
 
