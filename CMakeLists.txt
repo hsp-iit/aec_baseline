@@ -25,11 +25,17 @@ endif()
 set(WEBRTC_AUDIO_PROCESSING_ROOT "${WEBRTC_AUDIO_PROCESSING_ROOT_RESOLVED}")
 
 set(WAP_LOCAL_PKGCONFIG_DIRS)
-foreach(WAP_LOCAL_PKGCONFIG_DIR
-        "${WEBRTC_AUDIO_PROCESSING_ROOT}/lib/x86_64-linux-gnu/pkgconfig"
-        "${WEBRTC_AUDIO_PROCESSING_ROOT}/lib/pkgconfig"
-        "${WEBRTC_AUDIO_PROCESSING_ROOT}/share/pkgconfig")
-    if(EXISTS "${WAP_LOCAL_PKGCONFIG_DIR}/webrtc-audio-processing-2.pc")
+
+# Look for pkg-config directories including architecture-specific lib folders
+file(GLOB WAP_PKGCONFIG_CANDIDATES
+    "${WEBRTC_AUDIO_PROCESSING_ROOT}/lib/*-linux-gnu/pkgconfig"
+    "${WEBRTC_AUDIO_PROCESSING_ROOT}/lib/pkgconfig"
+    "${WEBRTC_AUDIO_PROCESSING_ROOT}/share/pkgconfig"
+)
+foreach(WAP_LOCAL_PKGCONFIG_DIR ${WAP_PKGCONFIG_CANDIDATES})
+    if(EXISTS "${WAP_LOCAL_PKGCONFIG_DIR}/webrtc-audio-processing-2.pc"
+       OR EXISTS "${WAP_LOCAL_PKGCONFIG_DIR}/webrtc-audio-processing.pc"
+       OR EXISTS "${WAP_LOCAL_PKGCONFIG_DIR}/webrtc_audio_processing.pc")
         list(APPEND WAP_LOCAL_PKGCONFIG_DIRS "${WAP_LOCAL_PKGCONFIG_DIR}")
     endif()
 endforeach()
