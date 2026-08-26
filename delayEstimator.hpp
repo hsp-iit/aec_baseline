@@ -17,6 +17,8 @@ public:
 
     // Update the internal delay estimate using GCC-PHAT.
     // The reference signal is resampled to the microphone sample rate first.
+    // The returned delay is a non-negative offset into the reference buffer
+    // indicating where the reference best aligns with the microphone signal.
     bool update(const std::vector<short> &micSignal,
                 int micSampleRate,
                 const std::vector<short> &referenceSignal,

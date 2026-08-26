@@ -20,6 +20,7 @@
 #include <yarp/os/RFModule.h>
 #include <yarp/os/BufferedPort.h>
 #include <yarp/sig/Sound.h>
+#include <yarp/sig/SoundFilters.h>
 
 #include "api/scoped_refptr.h"
 #include "modules/audio_processing/include/audio_processing.h"
@@ -57,18 +58,17 @@ private:
     bool m_shouldExit;
 
     // Buffers to accumulate samples when incoming frames are larger than AEC frame size
-    std::deque<short> m_micBuffer;
-    std::deque<short> m_refBuffer;
-    std::deque<short> m_outBuffer;
-    std::deque<short> m_audioSaveBuffer;
-    // Last observed incoming microphone block size in samples (used to emit matching chunks)
-    int m_lastMicBlockSamples = 0;
+    std::vector<short> m_micBuffer;
+    std::vector<short> m_refBuffer;
+    std::vector<short> m_outBuffer;
+    std::vector<short> m_audioSaveBuffer;
 
     // Audio buffer management
     void processingThreadFunction();
     bool initializeAEC(int sample_rate, int num_channels);
     bool saveAudioBlockToDisk(const std::vector<short> &samples);
     void flushAudioSaveBuffer(bool flushRemainder = false);
+    void sendFilteredAudio(const std::vector<short> &samples, int sampleRate);
 
     // Configuration parameters
     int m_sample_rate;
@@ -76,6 +76,7 @@ private:
     int m_block_ms;
     bool m_saveIterativeAudioToDisk;
     int m_audioSaveMaxSeconds;
+    double m_referenceBufferSeconds;
     std::string m_audioSaveDirectory;
     std::string m_audioSavePrefix;
     std::size_t m_audioSaveSequence;
@@ -84,8 +85,7 @@ private:
     bool m_aecMobileMode;
     int m_aecStreamDelayMs;
     bool m_logAecStats;
-    std::size_t m_aecFramesWithReference;
-    std::size_t m_aecFramesWithoutReference;
+    int m_lastEstimatedDelayIndex{-1};
     std::chrono::steady_clock::time_point m_lastAecStatsLog;
 
     ReferenceReader m_referenceReader;

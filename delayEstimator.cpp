@@ -173,18 +173,35 @@ DelayResult estimateDelayGccPhat(const std::vector<short> &micSignal,
         }
     }
 
-    if (bestIndex > correlationSize / 2)
+    int signedLag = 0;
+    if (bestIndex <= correlationSize / 2)
     {
-        result.delaySamples = -static_cast<int>(correlationSize - bestIndex);
+        signedLag = static_cast<int>(bestIndex);
     }
     else
     {
-        result.delaySamples = static_cast<int>(bestIndex);
+        signedLag = static_cast<int>(bestIndex) - static_cast<int>(correlationSize);
+    }
+
+    if (signedLag >= 0)
+    {
+        // Interpret positive lag as an index into the reference signal where mic[0] aligns.
+        const int maxRefIndex = static_cast<int>(referenceSignal.size()) - 1;
+        if (signedLag > maxRefIndex)
+            result.delaySamples = maxRefIndex;
+        else
+            result.delaySamples = signedLag;
+    }
+    else
+    {
+        // Preserve negative lag (reference follows the mic) as a negative sample offset.
+        result.delaySamples = signedLag;
     }
 
     if (bestCorrelation > 1e-12)
     {
-        result.confidence = (correlationSum / static_cast<double>(correlationSize)) / bestCorrelation;
+        const double averageCorrelation = correlationSum / static_cast<double>(correlationSize);
+        result.confidence = std::clamp(1.0 - (averageCorrelation / bestCorrelation), 0.0, 1.0);
     }
 
     return result;
@@ -207,8 +224,16 @@ bool DelayEstimator::update(const std::vector<short> &micSignal,
     {
         return false;
     }
-
-    const std::vector<short> referenceAtMicRate = resampleLinear(referenceSignal, referenceSampleRate, micSampleRate);
+    std::vector<short> referenceAtMicRate;
+    if (micSampleRate != referenceSampleRate)
+    {
+        referenceAtMicRate = resampleLinear(referenceSignal, referenceSampleRate, micSampleRate);
+    }
+    else
+    {
+        referenceAtMicRate = referenceSignal;
+    }
+    
     const DelayResult result = estimateDelayGccPhat(micSignal, referenceAtMicRate);
     m_confidence = result.confidence;
 

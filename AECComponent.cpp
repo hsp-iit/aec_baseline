@@ -18,79 +18,28 @@
 
 namespace
 {
-std::vector<short> resampleLinear(const std::vector<short> &inputSamples,
-                                  int inputSampleRate,
-                                  int outputSampleRate)
-{
-    if (inputSamples.empty() || inputSampleRate <= 0 || outputSampleRate <= 0 || inputSampleRate == outputSampleRate)
+
+    void appendSamples(std::deque<short> &buffer, const std::vector<short> &samples)
     {
-        return inputSamples;
-    }
-
-    const double ratio = static_cast<double>(outputSampleRate) / static_cast<double>(inputSampleRate);
-    const std::size_t outputSize = std::max<std::size_t>(1, static_cast<std::size_t>(std::llround(inputSamples.size() * ratio)));
-    std::vector<short> outputSamples(outputSize);
-
-    for (std::size_t index = 0; index < outputSize; ++index)
-    {
-        const double sourcePosition = static_cast<double>(index) / ratio;
-        const std::size_t leftIndex = static_cast<std::size_t>(std::floor(sourcePosition));
-        const std::size_t rightIndex = std::min(leftIndex + 1, inputSamples.size() - 1);
-        const double fraction = sourcePosition - static_cast<double>(leftIndex);
-
-        const double leftSample = static_cast<double>(inputSamples[leftIndex]);
-        const double rightSample = static_cast<double>(inputSamples[rightIndex]);
-        const double interpolatedSample = leftSample + (rightSample - leftSample) * fraction;
-        outputSamples[index] = static_cast<short>(std::lround(interpolatedSample));
-    }
-
-    return outputSamples;
-}
-
-void appendSamples(std::deque<short> &buffer, const std::vector<short> &samples)
-{
-    for (short sample : samples)
-    {
-        buffer.push_back(sample);
-    }
-}
-
-std::vector<short> takeTailSamples(const std::deque<short> &buffer, std::size_t sampleCount)
-{
-    if (buffer.empty() || sampleCount == 0)
-    {
-        return {};
-    }
-
-    const std::size_t beginOffset = buffer.size() > sampleCount ? buffer.size() - sampleCount : 0;
-    std::vector<short> samples;
-    samples.reserve(buffer.size() - beginOffset);
-
-    std::size_t index = 0;
-    for (short sample : buffer)
-    {
-        if (index++ >= beginOffset)
+        for (short sample : samples)
         {
-            samples.push_back(sample);
+            buffer.push_back(sample);
         }
     }
 
-    return samples;
-}
+    void writeLittleEndian16(std::ostream &stream, std::uint16_t value)
+    {
+        stream.put(static_cast<char>(value & 0xff));
+        stream.put(static_cast<char>((value >> 8) & 0xff));
+    }
 
-void writeLittleEndian16(std::ostream &stream, std::uint16_t value)
-{
-    stream.put(static_cast<char>(value & 0xff));
-    stream.put(static_cast<char>((value >> 8) & 0xff));
-}
-
-void writeLittleEndian32(std::ostream &stream, std::uint32_t value)
-{
-    stream.put(static_cast<char>(value & 0xff));
-    stream.put(static_cast<char>((value >> 8) & 0xff));
-    stream.put(static_cast<char>((value >> 16) & 0xff));
-    stream.put(static_cast<char>((value >> 24) & 0xff));
-}
+    void writeLittleEndian32(std::ostream &stream, std::uint32_t value)
+    {
+        stream.put(static_cast<char>(value & 0xff));
+        stream.put(static_cast<char>((value >> 8) & 0xff));
+        stream.put(static_cast<char>((value >> 16) & 0xff));
+        stream.put(static_cast<char>((value >> 24) & 0xff));
+    }
 }
 
 AECComponent::AECComponent()
@@ -101,16 +50,15 @@ AECComponent::AECComponent()
       m_num_channels(1),
       m_block_ms(10),
       m_saveIterativeAudioToDisk(false),
-            m_audioSaveMaxSeconds(30),
+      m_audioSaveMaxSeconds(30),
+      m_referenceBufferSeconds(10.0),
       m_audioSaveDirectory("./aec-recordings"),
       m_audioSavePrefix("aec_output"),
-            m_audioSaveSequence(0),
-            m_aecMobileMode(false),
-            m_aecStreamDelayMs(120),
-            m_logAecStats(true),
-            m_aecFramesWithReference(0),
-            m_aecFramesWithoutReference(0),
-            m_lastAecStatsLog(std::chrono::steady_clock::now())
+      m_audioSaveSequence(0),
+      m_aecMobileMode(false),
+      m_aecStreamDelayMs(120),
+      m_logAecStats(true),
+      m_lastAecStatsLog(std::chrono::steady_clock::now())
 {
     // m_referenceReader = ReferenceReader();
     m_delayEstimator = DelayEstimator();
@@ -134,7 +82,7 @@ bool AECComponent::configure(yarp::os::ResourceFinder &rf)
     if (okCheck)
     {
         yarp::os::Searchable &aecConfig = rf.findGroup("AEC_COMPONENT");
-        
+
         if (aecConfig.check("microphoneInputPort"))
         {
             microphoneInputPortName = aecConfig.find("microphoneInputPort").asString();
@@ -175,6 +123,10 @@ bool AECComponent::configure(yarp::os::ResourceFinder &rf)
         {
             m_audioSaveMaxSeconds = aecConfig.find("audioSaveMaxSeconds").asInt32();
         }
+        if (aecConfig.check("referenceBufferSeconds"))
+        {
+            m_referenceBufferSeconds = aecConfig.find("referenceBufferSeconds").asFloat64();
+        }
         if (aecConfig.check("aec_mobile_mode"))
         {
             m_aecMobileMode = aecConfig.find("aec_mobile_mode").asBool();
@@ -194,6 +146,11 @@ bool AECComponent::configure(yarp::os::ResourceFinder &rf)
         yWarning() << "[AECComponent::configure] audioSaveMaxSeconds must be > 0, falling back to 30";
         m_audioSaveMaxSeconds = 30;
     }
+    if (m_referenceBufferSeconds <= 0.0)
+    {
+        yWarning() << "[AECComponent::configure] referenceBufferSeconds must be > 0, falling back to 10";
+        m_referenceBufferSeconds = 10.0;
+    }
     if (m_aecStreamDelayMs < 0)
     {
         yWarning() << "[AECComponent::configure] aec_stream_delay_ms must be >= 0, clamping to 0";
@@ -210,6 +167,7 @@ bool AECComponent::configure(yarp::os::ResourceFinder &rf)
         yInfo() << "[AECComponent::configure] Audio save prefix:" << m_audioSavePrefix;
         yInfo() << "[AECComponent::configure] Max saved file length:" << m_audioSaveMaxSeconds << "seconds";
     }
+    yInfo() << "[AECComponent::configure] Reference buffer limit:" << m_referenceBufferSeconds << "seconds";
     yInfo() << "[AECComponent::configure] AEC mobile mode:" << (m_aecMobileMode ? "ENABLED" : "DISABLED");
     yInfo() << "[AECComponent::configure] AEC stream delay:" << m_aecStreamDelayMs << "ms";
     yInfo() << "[AECComponent::configure] AEC stats log:" << (m_logAecStats ? "ENABLED" : "DISABLED");
@@ -266,14 +224,14 @@ bool AECComponent::initializeAEC(int sample_rate, int num_channels)
 
         // Configure AEC settings
         webrtc::AudioProcessing::Config config;
-        
+
         // Echo Cancellation
         config.echo_canceller.enabled = true;
         config.echo_canceller.mobile_mode = m_aecMobileMode;
 
         // Gain Control 1 (Analog)
         config.gain_controller1.enabled = true;
-        config.gain_controller1.mode = 
+        config.gain_controller1.mode =
             webrtc::AudioProcessing::Config::GainController1::kAdaptiveAnalog;
 
         // Gain Control 2
@@ -287,7 +245,7 @@ bool AECComponent::initializeAEC(int sample_rate, int num_channels)
         // Create stream configuration
         m_streamConfig = new webrtc::StreamConfig(sample_rate, num_channels);
 
-        yInfo() << "[AECComponent::initializeAEC] AEC initialized successfully";
+        yInfo() << "[AECComponent::initializeAEC] AEC initialized successfully with sample rate:" << sample_rate << "Hz and channels:" << num_channels;
         yInfo() << "[AECComponent::initializeAEC] Echo cancellation: ENABLED";
         yInfo() << "[AECComponent::initializeAEC] Gain control 1: ENABLED (Adaptive Analog)";
         yInfo() << "[AECComponent::initializeAEC] Gain control 2: ENABLED";
@@ -315,6 +273,11 @@ void AECComponent::processingThreadFunction()
 
     while (!m_shouldExit)
     {
+
+        m_micBuffer.clear();
+        m_refBuffer.clear();
+        m_outBuffer.clear();
+        // wait for microphone input
         yInfo() << "[AECComponent::processingThread] Waiting for microphone audio input...";
         yarp::sig::Sound *microphoneAudio = m_microphoneAudioInputPort.read(true);
 
@@ -329,17 +292,22 @@ void AECComponent::processingThreadFunction()
 
         yInfo() << "[AECComponent::processingThread] Received microphone audio with" << (microphoneAudio ? microphoneAudio->getSamples() : 0) << "samples at" << (microphoneAudio ? microphoneAudio->getFrequency() : 0) << "Hz";
 
+        // split the microphone input into samples with a certain frequency
         std::vector<short> micSamples;
         for (int i = 0; i < static_cast<int>(microphoneAudio->getSamples()); ++i)
         {
             micSamples.push_back(microphoneAudio->get(i, 0));
         }
+
         yInfo() << "[AECComponent::processingThread] Extracted microphone samples into vector, size:" << micSamples.size();
-        m_lastMicBlockSamples = static_cast<int>(micSamples.size());
+
+        // read the microphone input frequency in case there's a misconfiguration
+        // correct it by reinitializing the microphone frequency
         int micFrequency = microphoneAudio->getFrequency();
-        if (micFrequency > 0 && micFrequency != m_sample_rate)
+        int micChannels = microphoneAudio->getChannels();
+        if (micFrequency > 0 && micFrequency != m_sample_rate || micChannels != m_num_channels)
         {
-            yInfo() << "[AECComponent::processingThread] Detected mic frequency" << micFrequency << "Hz, reinitializing AEC";
+            yInfo() << "[AECComponent::processingThread] Detected mic frequency" << micFrequency << "Hz and channels" << micChannels << ", reinitializing AEC";
             if (m_streamConfig)
             {
                 delete m_streamConfig;
@@ -355,116 +323,152 @@ void AECComponent::processingThreadFunction()
             }
 
             m_sample_rate = micFrequency;
+            m_num_channels = micChannels;
             if (!initializeAEC(m_sample_rate, m_num_channels))
             {
-                yError() << "[AECComponent::processingThread] Failed to reinitialize AEC with new sample rate";
+                yError() << "[AECComponent::processingThread] Failed to reinitialize AEC with new sample rate and channels";
             }
         }
 
-        std::vector<short> referenceSamples;
+        m_micBuffer = std::vector<short>(micSamples.begin(), micSamples.end());
+
+        // get the reference queue collected until this moment, and its sample rate
         int referenceSampleRate = 0;
-        while (m_referenceReader.tryPopBlock(referenceSamples, referenceSampleRate))
-        {
-            if (referenceSampleRate > 0 && referenceSampleRate != m_sample_rate)
-            {
-                referenceSamples = resampleLinear(referenceSamples, referenceSampleRate, m_sample_rate);
-                referenceSampleRate = m_sample_rate;
-            }
 
-            std::lock_guard<std::mutex> lock(m_mutex);
-            appendSamples(m_refBuffer, referenceSamples);
+        yarp::sig::Sound recordedReference = m_referenceReader.getRecordedReferenceBlocks();
+
+        // if the reference queue is empty, we can skip send the the microphone input to the output port as it is, since we don't have a reference to cancel the echo
+        if (recordedReference.getSamples() == 0)
+        {
+            yInfo() << "[AECComponent::processingThread] No reference blocks available, skipping AEC processing for this microphone block";
+            m_outBuffer = m_micBuffer;
+            sendFilteredAudio(m_outBuffer, m_sample_rate);
+            continue;
         }
 
+        yInfo() << "[AECComponent::processingThread] Retrieved recorded reference blocks with" << recordedReference.getSamples() << "samples at" << recordedReference.getFrequency() << "Hz";
+
+        referenceSampleRate = recordedReference.getFrequency();
+        int referenceNumChannels = recordedReference.getChannels();
+
+        yInfo() << "[AECComponent::processingThread] Reference blocks have" << referenceNumChannels << "channels";
+        if (referenceNumChannels != m_num_channels)
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            appendSamples(m_micBuffer, micSamples);
+            yWarning() << "[AECComponent::processingThread] Reference blocks have" << referenceNumChannels << "channels, but AEC is configured for" << m_num_channels << "channels. Only the first channel of the reference will be used.";
         }
 
-        const int frame_samples = std::max(1, static_cast<int>((m_sample_rate * m_block_ms) / 1000));
-        const std::size_t lagWindowSamples = std::max<std::size_t>(static_cast<std::size_t>(frame_samples) * 8, static_cast<std::size_t>(m_sample_rate));
-
-        std::vector<short> micWindow;
-        std::vector<short> refWindow;
+        if (referenceSampleRate > 0 && referenceSampleRate != m_sample_rate)
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            micWindow = takeTailSamples(m_micBuffer, lagWindowSamples);
-            refWindow = takeTailSamples(m_refBuffer, lagWindowSamples);
+            yInfo() << "[AECComponent::processingThread] Resampling reference from" << referenceSampleRate << "Hz to" << m_sample_rate << "Hz";
+            yarp::sig::soundfilters::resample(recordedReference, m_sample_rate);
+            referenceSampleRate = m_sample_rate;
         }
 
-        if (!micWindow.empty() && !refWindow.empty())
+        for (int i = 0; i < static_cast<int>(recordedReference.getSamples()); ++i)
         {
-            m_delayEstimator.update(micWindow, m_sample_rate, refWindow, m_sample_rate);
+            m_refBuffer.push_back(recordedReference.get(i, 0));
         }
-
-        const int estimatedDelaySamples = m_delayEstimator.estimatedDelaySamples();
-        const double delayConfidence = m_delayEstimator.confidence();
-        int activeStreamDelayMs = m_aecStreamDelayMs;
-        if (delayConfidence >= m_delayEstimator.confidenceThreshold() && m_sample_rate > 0)
+    
+        yInfo() << "[AECComponent::processingThread] Reference buffer size after resampling:" << m_refBuffer.size();
+        
+        if (!m_micBuffer.empty() && !m_refBuffer.empty())
         {
-            activeStreamDelayMs = std::max(0, static_cast<int>(std::lround(1000.0 * static_cast<double>(estimatedDelaySamples) / static_cast<double>(m_sample_rate))));
-            yInfo() << "[AECComponent::processingThread] Estimated delay:" << estimatedDelaySamples << "samples, confidence:" << delayConfidence;
+            yInfo() << "[AECComponent::processingThread] Updating delay estimator with mic buffer size:" << m_micBuffer.size() << "ref buffer size:" << m_refBuffer.size();
+
+            m_delayEstimator.update(m_micBuffer, m_sample_rate, m_refBuffer, m_sample_rate);
         }
         else
         {
-            yInfo() << "[AECComponent::processingThread] Delay confidence below threshold:" << delayConfidence;
+            yInfo() << "[AECComponent::processingThread] Skipping delay estimator update due to empty mic or ref buffer. Mic buffer size:" << m_micBuffer.size() << "Ref buffer size:" << m_refBuffer.size();
         }
 
-        while (true)
+        int estimatedDelayIndex = m_delayEstimator.estimatedDelaySamples();
+        const double delayConfidence = m_delayEstimator.confidence();
+        int activeStreamDelayMs = m_aecStreamDelayMs;
+        // extract from the reference buffer the sub vector of size mic buffer size, starting from the estimated delay index
+        std::vector<short> alignedReference;
+        if (estimatedDelayIndex >= 0 && delayConfidence >= m_delayEstimator.confidenceThreshold() && estimatedDelayIndex + static_cast<int>(m_micBuffer.size()) <= static_cast<int>(m_refBuffer.size()))
+        {   
+            m_lastEstimatedDelayIndex = estimatedDelayIndex;
+            const std::size_t startIndex = static_cast<std::size_t>(estimatedDelayIndex);
+            const std::size_t endIndex = std::min(startIndex + m_micBuffer.size(), m_refBuffer.size());
+            alignedReference = std::vector<short>(m_refBuffer.begin() + startIndex, m_refBuffer.begin() + endIndex);
+            yInfo() << "[AECComponent::processingThread] Aligned reference buffer size:" << alignedReference.size() << "from start index:" << startIndex << "to end index:" << endIndex;
+        }
+        else
+        {
+            // add in front of the reference buffer the number of zeros equal to the estimated delay index, and then take the first mic buffer size samples
+            if (estimatedDelayIndex < 0)
+            {
+                yInfo() << "[AECComponent::processingThread] Estimated delay index is negative:" << estimatedDelayIndex << "for reference buffer size:" << m_refBuffer.size();
+                yInfo() << "[AECComponent::processingThread] Estimated delay index is negative, adding" << -estimatedDelayIndex << "zeros in front of the reference buffer";
+                std::vector<short> zeroPadding(-estimatedDelayIndex, 0);
+                alignedReference.insert(alignedReference.end(), zeroPadding.begin(), zeroPadding.end());
+                alignedReference.insert(alignedReference.end(), m_refBuffer.begin(), m_refBuffer.begin() + std::min(static_cast<std::size_t>(m_micBuffer.size()), m_refBuffer.size()));
+                yInfo() << "[AECComponent::processingThread] Aligned reference buffer size after zero padding:" << alignedReference.size();
+            }
+            else
+            {
+                yInfo() << "[AECComponent::processingThread] Estimated delay index is too large for the reference buffer, using first" << std::min(static_cast<std::size_t>(m_micBuffer.size()), m_refBuffer.size()) << "samples of the reference buffer";
+                alignedReference = std::vector<short>(m_refBuffer.begin(), m_refBuffer.begin() + std::min(static_cast<std::size_t>(m_micBuffer.size()), m_refBuffer.size()));
+                yInfo() << "[AECComponent::processingThread] Aligned reference buffer size:" << alignedReference.size();
+            }
+            
+
+            // yInfo() << "[AECComponent::processingThread] Using last available reference samples for AEC processing if available, otherwise using estimatd stream delay from configuration";
+            
+            // if (m_lastEstimatedDelayIndex != -1)
+            // {
+            //     yInfo() << "[AECComponent::processingThread] Last estimated delay index:" << m_lastEstimatedDelayIndex;
+            //     estimatedDelayIndex = m_lastEstimatedDelayIndex;
+            // }
+            // else
+            // {
+            //     yInfo() << "[AECComponent::processingThread] No last estimated delay index available, using configured AEC stream delay:" << m_aecStreamDelayMs << "ms";
+            //     estimatedDelayIndex = m_aecStreamDelayMs * m_sample_rate / 1000;
+            // }
+            
+            // if (m_refBuffer.size() >= m_micBuffer.size())
+            // {
+            //     alignedReference = std::vector<short>(m_refBuffer.begin() + estimatedDelayIndex, m_refBuffer.begin() + estimatedDelayIndex + m_micBuffer.size());
+            //     yInfo() << "[AECComponent::processingThread] Using last available reference samples for AEC processing, aligned reference buffer size:" << alignedReference.size();
+            // }
+            // else
+            // {
+            //     yInfo() << "[AECComponent::processingThread] Not enough reference samples available for AEC processing";
+            // }
+        }
+
+        const int frame_samples = std::max(1, static_cast<int>((m_sample_rate * m_block_ms) / 1000));
+
+        for (int i = 0; i < static_cast<int>(m_micBuffer.size() / frame_samples); ++i)
         {
             std::vector<short> mic_frame;
             std::vector<short> ref_frame;
-            bool hadReferenceData = false;
 
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (static_cast<int>(m_micBuffer.size()) < frame_samples)
-                    break; // not enough mic samples yet
+            if (static_cast<int>(m_micBuffer.size()) < frame_samples)
+                break; // not enough mic samples yet
 
-                // pop mic frame
-                mic_frame.resize(frame_samples);
-                for (int i = 0; i < frame_samples; ++i)
-                {
-                    mic_frame[i] = m_micBuffer.front();
-                    m_micBuffer.pop_front();
-                }
-
-                // pop ref frame if available
-                if (static_cast<int>(m_refBuffer.size()) >= frame_samples)
-                {
-                    hadReferenceData = true;
-                    ref_frame.resize(frame_samples);
-                    for (int i = 0; i < frame_samples; ++i)
-                    {
-                        ref_frame[i] = m_refBuffer.front();
-                        m_refBuffer.pop_front();
-                    }
-                }
-                else
-                {
-                    // Keep AEC state progression consistent even when reference temporarily lags.
-                    ref_frame.assign(frame_samples, 0);
-                }
-            }
+            mic_frame.insert(mic_frame.begin(), m_micBuffer.begin() + i * frame_samples, m_micBuffer.begin() + (i + 1) * frame_samples);
+            ref_frame.insert(ref_frame.begin(), alignedReference.begin() + i * frame_samples, alignedReference.begin() + (i + 1) * frame_samples);
 
             try
             {
-                m_apm->set_stream_delay_ms(activeStreamDelayMs);
+                // m_apm->set_stream_delay_ms(activeStreamDelayMs);
                 m_apm->ProcessReverseStream(ref_frame.data(), *m_streamConfig, *m_streamConfig, ref_frame.data());
                 m_apm->ProcessStream(mic_frame.data(), *m_streamConfig, *m_streamConfig, mic_frame.data());
-                if (hadReferenceData)
-                {
-                    ++m_aecFramesWithReference;
-                }
-                else
-                {
-                    ++m_aecFramesWithoutReference;
-                }
-
+                
                 // Append processed frame to output buffer; we'll emit in larger chunks
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
-                    for (int i = 0; i < frame_samples; ++i)
-                        m_outBuffer.push_back(mic_frame[i]);
+                    for (int j = 0; j < frame_samples; ++j)
+                    {
+                        m_outBuffer.push_back(mic_frame[j]);
+                        if (m_saveIterativeAudioToDisk)
+                        {
+                            m_audioSaveBuffer.push_back(mic_frame[j]);
+                        }
+                    }
                 }
             }
             catch (const std::exception &e)
@@ -478,68 +482,39 @@ void AECComponent::processingThreadFunction()
                 const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastAecStatsLog).count();
                 if (elapsed >= 1)
                 {
-                    yInfo() << "[AECComponent::processingThread] AEC active - frames with reference:" << m_aecFramesWithReference
-                            << "without reference:" << m_aecFramesWithoutReference
+                    yInfo() << "[AECComponent::processingThread] AEC active - "
                             << "mic buffer:" << m_micBuffer.size()
                             << "ref buffer:" << m_refBuffer.size();
-                    m_aecFramesWithReference = 0;
-                    m_aecFramesWithoutReference = 0;
+                    
                     m_lastAecStatsLog = now;
                 }
             }
         }
 
-        if (m_lastMicBlockSamples > 0)
+        // write to output port the filtered microphone audio
+        sendFilteredAudio(m_outBuffer, m_sample_rate);
+
+        // save to disk if enabled
+        if (m_saveIterativeAudioToDisk)
         {
-            while (true)
-            {
-                int emit_samples = 0;
-                {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    if (static_cast<int>(m_outBuffer.size()) >= m_lastMicBlockSamples)
-                    {
-                        emit_samples = m_lastMicBlockSamples;
-                    }
-                }
-
-                if (emit_samples == 0)
-                    break;
-
-                // pop emit_samples into a temporary buffer and send as one Sound
-                std::vector<short> emit_buf(emit_samples);
-                {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    for (int i = 0; i < emit_samples; ++i)
-                    {
-                        emit_buf[i] = m_outBuffer.front();
-                        m_outBuffer.pop_front();
-                    }
-                }
-
-                yarp::sig::Sound &out = m_audioOutputPort.prepare();
-                out.resize(emit_samples, 1);
-                out.setFrequency(m_sample_rate);
-                for (int i = 0; i < emit_samples; ++i)
-                {
-                    out.set(emit_buf[i], i, 0);
-                }
-                yDebug() << "[AECComponent::processingThread] Emitting aggregated block of" << emit_samples << "samples";
-
-                if (m_saveIterativeAudioToDisk)
-                {
-                    for (short sample : emit_buf)
-                    {
-                        m_audioSaveBuffer.push_back(sample);
-                    }
-                    flushAudioSaveBuffer(false);
-                }
-
-                m_audioOutputPort.write();
-            }
+            flushAudioSaveBuffer(false);
         }
-    }
 
-    yInfo() << "[AECComponent::processingThread] Processing thread exiting";
+        yInfo() << "[AECComponent::processingThread] Processing thread exiting";
+    }
+}
+
+void AECComponent::sendFilteredAudio(const std::vector<short> &samples, int sampleRate)
+{
+    yarp::sig::Sound &out = m_audioOutputPort.prepare();
+    out.resize(static_cast<int>(samples.size()), 1);
+    out.setFrequency(sampleRate);
+    for (std::size_t i = 0; i < samples.size(); ++i)
+    {
+        out.set(samples[i], static_cast<int>(i), 0);
+    }
+    yDebug() << "[AECComponent::sendFilteredAudio] Sending filtered audio block of" << samples.size() << "samples at" << sampleRate << "Hz";
+    m_audioOutputPort.write();
 }
 
 bool AECComponent::close()
@@ -581,7 +556,7 @@ bool AECComponent::updateModule()
 
 double AECComponent::getPeriod()
 {
-    return 0.1;  // Update period in seconds
+    return 0.1; // Update period in seconds
 }
 
 bool AECComponent::saveAudioBlockToDisk(const std::vector<short> &samples)
@@ -662,9 +637,9 @@ void AECComponent::flushAudioSaveBuffer(bool flushRemainder)
 
         for (int i = 0; i < samplesToWrite; ++i)
         {
-            samples.push_back(m_audioSaveBuffer.front());
-            m_audioSaveBuffer.pop_front();
+            samples.push_back(m_audioSaveBuffer[i]);
         }
+        m_audioSaveBuffer.erase(m_audioSaveBuffer.begin(), m_audioSaveBuffer.begin() + samplesToWrite);
 
         if (!saveAudioBlockToDisk(samples))
         {
