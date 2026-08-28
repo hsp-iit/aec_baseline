@@ -386,58 +386,22 @@ void AECComponent::processingThreadFunction()
         const double delayConfidence = m_delayEstimator.confidence();
         int activeStreamDelayMs = m_aecStreamDelayMs;
         // extract from the reference buffer the sub vector of size mic buffer size, starting from the estimated delay index
-        std::vector<short> alignedReference;
-        if (estimatedDelayIndex >= 0 && delayConfidence >= m_delayEstimator.confidenceThreshold() && estimatedDelayIndex + static_cast<int>(m_micBuffer.size()) <= static_cast<int>(m_refBuffer.size()))
-        {   
-            m_lastEstimatedDelayIndex = estimatedDelayIndex;
-            const std::size_t startIndex = static_cast<std::size_t>(estimatedDelayIndex);
-            const std::size_t endIndex = std::min(startIndex + m_micBuffer.size(), m_refBuffer.size());
-            alignedReference = std::vector<short>(m_refBuffer.begin() + startIndex, m_refBuffer.begin() + endIndex);
-            yInfo() << "[AECComponent::processingThread] Aligned reference buffer size:" << alignedReference.size() << "from start index:" << startIndex << "to end index:" << endIndex;
+        // std::vector<short> alignedReference;
+
+        yInfo() << "[AECComponent::processingThread] Estimated delay index:" << estimatedDelayIndex << "with confidence:" << delayConfidence;
+
+        if (delayConfidence < m_delayEstimator.confidenceThreshold())
+        {
+            yWarning() << "[AECComponent::processingThread] Low confidence in delay estimation:" << delayConfidence << ", using configured AEC stream delay:" << m_aecStreamDelayMs << "ms";
+            activeStreamDelayMs = m_aecStreamDelayMs;
         }
         else
         {
-            // add in front of the reference buffer the number of zeros equal to the estimated delay index, and then take the first mic buffer size samples
-            if (estimatedDelayIndex < 0)
-            {
-                yInfo() << "[AECComponent::processingThread] Estimated delay index is negative:" << estimatedDelayIndex << "for reference buffer size:" << m_refBuffer.size();
-                yInfo() << "[AECComponent::processingThread] Estimated delay index is negative, adding" << -estimatedDelayIndex << "zeros in front of the reference buffer";
-                std::vector<short> zeroPadding(-estimatedDelayIndex, 0);
-                alignedReference.insert(alignedReference.end(), zeroPadding.begin(), zeroPadding.end());
-                alignedReference.insert(alignedReference.end(), m_refBuffer.begin(), m_refBuffer.begin() + std::min(static_cast<std::size_t>(m_micBuffer.size()), m_refBuffer.size()));
-                yInfo() << "[AECComponent::processingThread] Aligned reference buffer size after zero padding:" << alignedReference.size();
-            }
-            else
-            {
-                yInfo() << "[AECComponent::processingThread] Estimated delay index is too large for the reference buffer, using first" << std::min(static_cast<std::size_t>(m_micBuffer.size()), m_refBuffer.size()) << "samples of the reference buffer";
-                alignedReference = std::vector<short>(m_refBuffer.begin(), m_refBuffer.begin() + std::min(static_cast<std::size_t>(m_micBuffer.size()), m_refBuffer.size()));
-                yInfo() << "[AECComponent::processingThread] Aligned reference buffer size:" << alignedReference.size();
-            }
-            
-
-            // yInfo() << "[AECComponent::processingThread] Using last available reference samples for AEC processing if available, otherwise using estimatd stream delay from configuration";
-            
-            // if (m_lastEstimatedDelayIndex != -1)
-            // {
-            //     yInfo() << "[AECComponent::processingThread] Last estimated delay index:" << m_lastEstimatedDelayIndex;
-            //     estimatedDelayIndex = m_lastEstimatedDelayIndex;
-            // }
-            // else
-            // {
-            //     yInfo() << "[AECComponent::processingThread] No last estimated delay index available, using configured AEC stream delay:" << m_aecStreamDelayMs << "ms";
-            //     estimatedDelayIndex = m_aecStreamDelayMs * m_sample_rate / 1000;
-            // }
-            
-            // if (m_refBuffer.size() >= m_micBuffer.size())
-            // {
-            //     alignedReference = std::vector<short>(m_refBuffer.begin() + estimatedDelayIndex, m_refBuffer.begin() + estimatedDelayIndex + m_micBuffer.size());
-            //     yInfo() << "[AECComponent::processingThread] Using last available reference samples for AEC processing, aligned reference buffer size:" << alignedReference.size();
-            // }
-            // else
-            // {
-            //     yInfo() << "[AECComponent::processingThread] Not enough reference samples available for AEC processing";
-            // }
+            yInfo() << "[AECComponent::processingThread] Using estimated delay index:" << estimatedDelayIndex << "with confidence:" << delayConfidence << "for AEC processing";
+            activeStreamDelayMs = static_cast<int>(static_cast<double>(estimatedDelayIndex) * 1000.0 / static_cast<double>(m_sample_rate));
         }
+
+        auto alignedReference = std::vector<short>(m_refBuffer.begin(), m_refBuffer.end());
 
         const int frame_samples = std::max(1, static_cast<int>((m_sample_rate * m_block_ms) / 1000));
 
@@ -454,7 +418,7 @@ void AECComponent::processingThreadFunction()
 
             try
             {
-                // m_apm->set_stream_delay_ms(activeStreamDelayMs);
+                m_apm->set_stream_delay_ms(activeStreamDelayMs);
                 m_apm->ProcessReverseStream(ref_frame.data(), *m_streamConfig, *m_streamConfig, ref_frame.data());
                 m_apm->ProcessStream(mic_frame.data(), *m_streamConfig, *m_streamConfig, mic_frame.data());
                 

@@ -118,8 +118,20 @@ void ReferenceReader::readerThreadFunction()
         double soundSeconds = static_cast<double>(sound->getSamples()) / sound->getFrequency();
 
         // std::chrono::seconds soundSeconds = std::chrono::seconds(static_cast<int>(sound->getSamples()) / sound->getFrequency());
-        // record in a variable called soundTTL the time when the sound will be considered expired, which is now + soundSeconds
-        std::chrono::time_point<std::chrono::system_clock> soundTTL = now + std::chrono::milliseconds(static_cast<int>(soundSeconds * 1000));
+        // record in a variable called soundTTL the time when the sound will be considered expired, which is now + soundSeconds if 
+        // the sound list is empty, or the last timestamp in the queue + soundSeconds if the sound list is not empty
+        std::chrono::time_point<std::chrono::system_clock> soundTTL;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_timestamps.empty())
+            {
+                soundTTL = now + std::chrono::milliseconds(static_cast<int>(soundSeconds * 1000));
+            }
+            else
+            {
+                soundTTL = m_timestamps.back() + std::chrono::milliseconds(static_cast<int>(soundSeconds * 1000));
+            }
+        }
 
         // auto now = std::chrono::system_clock::now();
 
@@ -154,6 +166,7 @@ void ReferenceReader::readerThreadFunction()
 
 yarp::sig::Sound ReferenceReader::getRecordedReferenceBlocks()
 {
+    auto now = std::chrono::system_clock::now();
     // remove stale reference blocks from the queue before returning the first one
     deleteStaleReferenceBlocks();
 
@@ -164,10 +177,41 @@ yarp::sig::Sound ReferenceReader::getRecordedReferenceBlocks()
         blocks = std::deque<yarp::sig::Sound>(m_queue.begin(), m_queue.end());
     }
 
-    // return the first block if available, otherwise return an empty Sound.
+    // return a neighborhood of the first block in the queue that has a valid timestamp, or an empty Sound if the queue is empty
     // Note: the first block is the oldest one in the queue, having a timestamp that is less than or equal to the current time.
     // this means that ideally it has not been completely consumed yet, and may be still be played by the audio player
-    return blocks.empty() ? yarp::sig::Sound() : blocks[0];
+    yarp::sig::Sound blockNeighborhood;
+    yarp::sig::Sound firstBlock;
+    if (!blocks.empty())
+    {
+        firstBlock = blocks.front();
+        int soundFrequency = firstBlock.getFrequency();
+        // compute the time passed since the first block was recorded, and compute how many samples have not been consumed yet, and return a neighborhood of the first block that has a valid timestamp, starting from the sample that has not been consumed yet
+        
+        auto firstBlockTimestamp = m_timestamps.front();
+        auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(firstBlockTimestamp - now).count();
+
+        int remainingSamples = static_cast<int>(firstBlock.getSamples()) - static_cast<int>(remaining_ms * soundFrequency / 1000);
+
+        // use remainingSamples to get a neighborhood of size 8000 samples at 16000 Hz from the first block, starting from the sample that has not been consumed yet. If the block has sound frequency different than 16000 Hz, scale the neighborhood size accordingly. If the block has less than 8000 samples remaining, return all remaining samples.
+        int neighborhoodSize = static_cast<int>(8000 * soundFrequency / 16000);
+        int startSample = std::max(0, static_cast<int>(firstBlock.getSamples()) - remainingSamples - 2000);
+        int endSample = std::min(static_cast<int>(firstBlock.getSamples()), startSample + neighborhoodSize);
+
+        blockNeighborhood.resize(endSample - startSample, firstBlock.getChannels());
+        blockNeighborhood.setFrequency(soundFrequency);
+        for (int i = startSample; i < endSample; ++i)
+        {
+            for (int j = 0; j < firstBlock.getChannels(); ++j)
+            {
+                blockNeighborhood.set(firstBlock.get(i, j), i - startSample, j);
+            }
+        }
+
+    }
+
+
+    return blocks.empty() ? yarp::sig::Sound() : blockNeighborhood;
 }
 
 void ReferenceReader::deleteStaleReferenceBlocks()
@@ -190,7 +234,7 @@ void ReferenceReader::deleteStaleReferenceBlocks()
                          .count();
 
         auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                now - timestamp)
+                                timestamp - now)
                                 .count();
 
         yInfo() << "[ReferenceReader] now =" << now_ms << "ms,"
