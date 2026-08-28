@@ -55,6 +55,8 @@ AECComponent::AECComponent()
       m_audioSaveDirectory("./aec-recordings"),
       m_audioSavePrefix("aec_output"),
       m_audioSaveSequence(0),
+      m_microphoneSaveSequence(0),
+      m_referenceSaveSequence(0),
       m_aecMobileMode(false),
       m_aecStreamDelayMs(120),
       m_logAecStats(true),
@@ -165,6 +167,7 @@ bool AECComponent::configure(yarp::os::ResourceFinder &rf)
     {
         yInfo() << "[AECComponent::configure] Audio save directory:" << m_audioSaveDirectory;
         yInfo() << "[AECComponent::configure] Audio save prefix:" << m_audioSavePrefix;
+        yInfo() << "[AECComponent::configure] Recording filtered, original microphone, and reference audio";
         yInfo() << "[AECComponent::configure] Max saved file length:" << m_audioSaveMaxSeconds << "seconds";
     }
     yInfo() << "[AECComponent::configure] Reference buffer limit:" << m_referenceBufferSeconds << "seconds";
@@ -320,6 +323,8 @@ void AECComponent::processingThreadFunction()
                 m_refBuffer.clear();
                 m_outBuffer.clear();
                 m_audioSaveBuffer.clear();
+                m_microphoneSaveBuffer.clear();
+                m_referenceSaveBuffer.clear();
             }
 
             m_sample_rate = micFrequency;
@@ -332,6 +337,11 @@ void AECComponent::processingThreadFunction()
 
         m_micBuffer = std::vector<short>(micSamples.begin(), micSamples.end());
 
+        if (m_saveIterativeAudioToDisk)
+        {
+            m_microphoneSaveBuffer.insert(m_microphoneSaveBuffer.end(), micSamples.begin(), micSamples.end());
+        }
+
         // get the reference queue collected until this moment, and its sample rate
         int referenceSampleRate = 0;
 
@@ -342,6 +352,14 @@ void AECComponent::processingThreadFunction()
         {
             yInfo() << "[AECComponent::processingThread] No reference blocks available, skipping AEC processing for this microphone block";
             m_outBuffer = m_micBuffer;
+            if (m_saveIterativeAudioToDisk)
+            {
+                m_audioSaveBuffer.insert(m_audioSaveBuffer.end(), m_outBuffer.begin(), m_outBuffer.end());
+                // save to disk the reference buffer as no sound with same size of m_outBuffer
+                auto nullReference = std::vector<short>(m_outBuffer.size(), 0);
+                m_referenceSaveBuffer.insert(m_referenceSaveBuffer.end(), nullReference.begin(), nullReference.end());
+                flushAllAudioSaveBuffers(false);
+            }
             sendFilteredAudio(m_outBuffer, m_sample_rate);
             continue;
         }
@@ -368,9 +386,9 @@ void AECComponent::processingThreadFunction()
         {
             m_refBuffer.push_back(recordedReference.get(i, 0));
         }
-    
+
         yInfo() << "[AECComponent::processingThread] Reference buffer size after resampling:" << m_refBuffer.size();
-        
+
         if (!m_micBuffer.empty() && !m_refBuffer.empty())
         {
             yInfo() << "[AECComponent::processingThread] Updating delay estimator with mic buffer size:" << m_micBuffer.size() << "ref buffer size:" << m_refBuffer.size();
@@ -386,22 +404,78 @@ void AECComponent::processingThreadFunction()
         const double delayConfidence = m_delayEstimator.confidence();
         int activeStreamDelayMs = m_aecStreamDelayMs;
         // extract from the reference buffer the sub vector of size mic buffer size, starting from the estimated delay index
-        // std::vector<short> alignedReference;
+        std::vector<short> alignedReference;
 
         yInfo() << "[AECComponent::processingThread] Estimated delay index:" << estimatedDelayIndex << "with confidence:" << delayConfidence;
 
-        if (delayConfidence < m_delayEstimator.confidenceThreshold())
+        if (estimatedDelayIndex >= 0 && delayConfidence >= m_delayEstimator.confidenceThreshold() && estimatedDelayIndex + static_cast<int>(m_micBuffer.size()) <= static_cast<int>(m_refBuffer.size()))
         {
-            yWarning() << "[AECComponent::processingThread] Low confidence in delay estimation:" << delayConfidence << ", using configured AEC stream delay:" << m_aecStreamDelayMs << "ms";
-            activeStreamDelayMs = m_aecStreamDelayMs;
+            m_lastEstimatedDelayIndex = estimatedDelayIndex;
+            const std::size_t startIndex = static_cast<std::size_t>(estimatedDelayIndex);
+            const std::size_t endIndex = std::min(startIndex + m_micBuffer.size(), m_refBuffer.size());
+            alignedReference = std::vector<short>(m_refBuffer.begin() + startIndex, m_refBuffer.begin() + endIndex);
+            yInfo() << "[AECComponent::processingThread] Using estimated delay index:" << estimatedDelayIndex << "with confidence:" << delayConfidence << "to align reference buffer for AEC processing";
+            yInfo() << "[AECComponent::processingThread] Aligned reference buffer size:" << alignedReference.size() << "from start index:" << startIndex << "to end index:" << endIndex;
         }
         else
         {
-            yInfo() << "[AECComponent::processingThread] Using estimated delay index:" << estimatedDelayIndex << "with confidence:" << delayConfidence << "for AEC processing";
-            activeStreamDelayMs = static_cast<int>(static_cast<double>(estimatedDelayIndex) * 1000.0 / static_cast<double>(m_sample_rate));
-        }
+            // add in front of the reference buffer the number of zeros equal to the estimated delay index, and then take the first mic buffer size samples
+            if (estimatedDelayIndex < 0)
+            {
+                yInfo() << "[AECComponent::processingThread] Estimated delay index is negative:" << estimatedDelayIndex << "for reference buffer size:" << m_refBuffer.size();
+                yInfo() << "[AECComponent::processingThread] Estimated delay index is negative, adding" << -estimatedDelayIndex << "zeros in front of the reference buffer";
+                std::vector<short> zeroPadding(-estimatedDelayIndex, 0);
+                alignedReference.insert(alignedReference.end(), zeroPadding.begin(), zeroPadding.end());
+                alignedReference.insert(alignedReference.end(), m_refBuffer.begin(), m_refBuffer.begin() + std::min(static_cast<std::size_t>(m_micBuffer.size()), m_refBuffer.size()));
+                yInfo() << "[AECComponent::processingThread] Aligned reference buffer size after zero padding:" << alignedReference.size();
+            }
+            else
+            {
+                yInfo() << "[AECComponent::processingThread] Estimated delay index is too large for the reference buffer, using first" << std::min(static_cast<std::size_t>(m_micBuffer.size()), m_refBuffer.size()) << "samples of the reference buffer";
+                alignedReference = std::vector<short>(m_refBuffer.begin(), m_refBuffer.begin() + std::min(static_cast<std::size_t>(m_micBuffer.size()), m_refBuffer.size()));
+                yInfo() << "[AECComponent::processingThread] Aligned reference buffer size:" << alignedReference.size();
+            }
 
-        auto alignedReference = std::vector<short>(m_refBuffer.begin(), m_refBuffer.end());
+            yInfo() << "[AECComponent::processingThread] Using last available reference samples for AEC processing if available, otherwise using estimatd stream delay from configuration";
+
+            if (m_lastEstimatedDelayIndex != -1)
+            {
+                yInfo() << "[AECComponent::processingThread] Last estimated delay index:" << m_lastEstimatedDelayIndex;
+                estimatedDelayIndex = m_lastEstimatedDelayIndex;
+            }
+            else
+            {
+                yInfo() << "[AECComponent::processingThread] No last estimated delay index available, using configured AEC stream delay:" << m_aecStreamDelayMs << "ms";
+                estimatedDelayIndex = m_aecStreamDelayMs * m_sample_rate / 1000;
+            }
+
+            if (m_refBuffer.size() >= m_micBuffer.size())
+            {
+                alignedReference = std::vector<short>(m_refBuffer.begin() + estimatedDelayIndex, m_refBuffer.begin() + estimatedDelayIndex + m_micBuffer.size());
+                yInfo() << "[AECComponent::processingThread] Using last available reference samples for AEC processing, aligned reference buffer size:" << alignedReference.size();
+            }
+            else
+            {
+                yInfo() << "[AECComponent::processingThread] Not enough reference samples available for AEC processing";
+            }
+        }
+        // if (delayConfidence < m_delayEstimator.confidenceThreshold())
+        // {
+        //     yWarning() << "[AECComponent::processingThread] Low confidence in delay estimation:" << delayConfidence << ", using configured AEC stream delay:" << m_aecStreamDelayMs << "ms";
+        //     activeStreamDelayMs = m_aecStreamDelayMs;
+        // }
+        // else
+        // {
+        //     yInfo() << "[AECComponent::processingThread] Using estimated delay index:" << estimatedDelayIndex << "with confidence:" << delayConfidence << "for AEC processing";
+        //     activeStreamDelayMs = static_cast<int>(static_cast<double>(estimatedDelayIndex) * 1000.0 / static_cast<double>(m_sample_rate));
+        // }
+
+        // auto alignedReference = std::vector<short>(m_refBuffer.begin(), m_refBuffer.end());
+
+        if (m_saveIterativeAudioToDisk)
+        {   
+            m_referenceSaveBuffer.insert(m_referenceSaveBuffer.end(), alignedReference.begin(), alignedReference.end());
+        }
 
         const int frame_samples = std::max(1, static_cast<int>((m_sample_rate * m_block_ms) / 1000));
 
@@ -421,7 +495,7 @@ void AECComponent::processingThreadFunction()
                 m_apm->set_stream_delay_ms(activeStreamDelayMs);
                 m_apm->ProcessReverseStream(ref_frame.data(), *m_streamConfig, *m_streamConfig, ref_frame.data());
                 m_apm->ProcessStream(mic_frame.data(), *m_streamConfig, *m_streamConfig, mic_frame.data());
-                
+
                 // Append processed frame to output buffer; we'll emit in larger chunks
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
@@ -449,7 +523,7 @@ void AECComponent::processingThreadFunction()
                     yInfo() << "[AECComponent::processingThread] AEC active - "
                             << "mic buffer:" << m_micBuffer.size()
                             << "ref buffer:" << m_refBuffer.size();
-                    
+
                     m_lastAecStatsLog = now;
                 }
             }
@@ -461,7 +535,7 @@ void AECComponent::processingThreadFunction()
         // save to disk if enabled
         if (m_saveIterativeAudioToDisk)
         {
-            flushAudioSaveBuffer(false);
+            flushAllAudioSaveBuffers(false);
         }
 
         yInfo() << "[AECComponent::processingThread] Processing thread exiting";
@@ -504,7 +578,7 @@ bool AECComponent::close()
 
     if (m_saveIterativeAudioToDisk)
     {
-        flushAudioSaveBuffer(true);
+        flushAllAudioSaveBuffers(true);
     }
 
     m_apm = nullptr;
@@ -523,7 +597,9 @@ double AECComponent::getPeriod()
     return 0.1; // Update period in seconds
 }
 
-bool AECComponent::saveAudioBlockToDisk(const std::vector<short> &samples)
+bool AECComponent::saveAudioBlockToDisk(const std::vector<short> &samples,
+                                        const std::string &streamName,
+                                        std::size_t sequence)
 {
     try
     {
@@ -537,7 +613,8 @@ bool AECComponent::saveAudioBlockToDisk(const std::vector<short> &samples)
         }
 
         std::ostringstream fileNameStream;
-        fileNameStream << m_audioSavePrefix << "_" << std::setw(6) << std::setfill('0') << m_audioSaveSequence++ << ".wav";
+        fileNameStream << m_audioSavePrefix << "_" << streamName << "_"
+                       << std::setw(6) << std::setfill('0') << sequence << ".wav";
 
         std::filesystem::path outputPath = outputDirectory / fileNameStream.str();
         std::ofstream outputFile(outputPath, std::ios::binary);
@@ -548,7 +625,8 @@ bool AECComponent::saveAudioBlockToDisk(const std::vector<short> &samples)
         }
 
         const std::uint32_t sampleRate = static_cast<std::uint32_t>(m_sample_rate);
-        const std::uint16_t channelCount = static_cast<std::uint16_t>(m_num_channels > 0 ? m_num_channels : 1);
+        // All saved streams contain the channel-zero samples extracted above.
+        const std::uint16_t channelCount = 1;
         const std::uint16_t bitsPerSample = 16;
         const std::uint16_t blockAlign = static_cast<std::uint16_t>(channelCount * (bitsPerSample / 8));
         const std::uint32_t byteRate = sampleRate * blockAlign;
@@ -583,7 +661,10 @@ bool AECComponent::saveAudioBlockToDisk(const std::vector<short> &samples)
     }
 }
 
-void AECComponent::flushAudioSaveBuffer(bool flushRemainder)
+void AECComponent::flushAudioSaveBuffer(std::vector<short> &buffer,
+                                        const std::string &streamName,
+                                        std::size_t &sequence,
+                                        bool flushRemainder)
 {
     if (!m_saveIterativeAudioToDisk)
     {
@@ -592,28 +673,35 @@ void AECComponent::flushAudioSaveBuffer(bool flushRemainder)
 
     const int maxSamplesPerFile = std::max(1, m_sample_rate * m_audioSaveMaxSeconds);
 
-    while (static_cast<int>(m_audioSaveBuffer.size()) >= maxSamplesPerFile ||
-           (flushRemainder && !m_audioSaveBuffer.empty()))
+    while (static_cast<int>(buffer.size()) >= maxSamplesPerFile ||
+           (flushRemainder && !buffer.empty()))
     {
-        const int samplesToWrite = static_cast<int>(std::min<std::size_t>(m_audioSaveBuffer.size(), static_cast<std::size_t>(maxSamplesPerFile)));
+        const int samplesToWrite = static_cast<int>(std::min<std::size_t>(buffer.size(), static_cast<std::size_t>(maxSamplesPerFile)));
         std::vector<short> samples;
         samples.reserve(samplesToWrite);
 
         for (int i = 0; i < samplesToWrite; ++i)
         {
-            samples.push_back(m_audioSaveBuffer[i]);
+            samples.push_back(buffer[i]);
         }
-        m_audioSaveBuffer.erase(m_audioSaveBuffer.begin(), m_audioSaveBuffer.begin() + samplesToWrite);
-
-        if (!saveAudioBlockToDisk(samples))
+        if (!saveAudioBlockToDisk(samples, streamName, sequence))
         {
-            yError() << "[AECComponent::flushAudioSaveBuffer] Failed to save audio chunk to disk";
+            yError() << "[AECComponent::flushAudioSaveBuffer] Failed to save" << streamName << " audio chunk to disk";
             break;
         }
+        buffer.erase(buffer.begin(), buffer.begin() + samplesToWrite);
+        ++sequence;
 
         if (!flushRemainder)
         {
             break;
         }
     }
+}
+
+void AECComponent::flushAllAudioSaveBuffers(bool flushRemainder)
+{
+    flushAudioSaveBuffer(m_audioSaveBuffer, "filtered", m_audioSaveSequence, flushRemainder);
+    flushAudioSaveBuffer(m_microphoneSaveBuffer, "microphone", m_microphoneSaveSequence, flushRemainder);
+    flushAudioSaveBuffer(m_referenceSaveBuffer, "reference", m_referenceSaveSequence, flushRemainder);
 }

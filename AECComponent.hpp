@@ -62,12 +62,20 @@ private:
     std::vector<short> m_refBuffer;
     std::vector<short> m_outBuffer;
     std::vector<short> m_audioSaveBuffer;
+    std::vector<short> m_microphoneSaveBuffer;
+    std::vector<short> m_referenceSaveBuffer;
 
     // Audio buffer management
     void processingThreadFunction();
     bool initializeAEC(int sample_rate, int num_channels);
-    bool saveAudioBlockToDisk(const std::vector<short> &samples);
-    void flushAudioSaveBuffer(bool flushRemainder = false);
+    bool saveAudioBlockToDisk(const std::vector<short> &samples,
+                              const std::string &streamName,
+                              std::size_t sequence);
+    void flushAudioSaveBuffer(std::vector<short> &buffer,
+                              const std::string &streamName,
+                              std::size_t &sequence,
+                              bool flushRemainder = false);
+    void flushAllAudioSaveBuffers(bool flushRemainder = false);
     void sendFilteredAudio(const std::vector<short> &samples, int sampleRate);
 
     // Configuration parameters
@@ -80,6 +88,8 @@ private:
     std::string m_audioSaveDirectory;
     std::string m_audioSavePrefix;
     std::size_t m_audioSaveSequence;
+    std::size_t m_microphoneSaveSequence;
+    std::size_t m_referenceSaveSequence;
 
     // AEC tuning and diagnostics
     bool m_aecMobileMode;
