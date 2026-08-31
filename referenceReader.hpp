@@ -21,6 +21,7 @@
 
 #include <yarp/os/BufferedPort.h>
 #include <yarp/sig/Sound.h>
+#include <yarp/sig/AudioPlayerStatus.h>
 
 class ReferenceReader
 {
@@ -48,7 +49,14 @@ public:
     // Delete staled reference blocks from the queue based on the duration of the audio block
     void deleteStaleReferenceBlocks();
 
+    // Update the index of the sliding window.
+    // void updateSlidingWindowIndex(int index);
+
+    bool isPlayerActive();
+
     yarp::sig::Sound getRecordedReferenceBlocks();
+
+    float getLastEstimatedAudioPlayerDelay();
 
 private:
 
@@ -62,6 +70,12 @@ private:
     std::deque<yarp::sig::Sound> m_queue;
     std::atomic<bool> m_running;
     std::atomic<bool> m_shouldExit;
+
+    yarp::os::BufferedPort<yarp::sig::AudioPlayerStatus> m_statusPort;
+
+    float m_audioPlayerDelayMs;
+
+    int m_slidingWindowIndex;
 };
 
 #endif // REFERENCE_READER__HPP

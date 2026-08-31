@@ -21,13 +21,13 @@
 #include <yarp/os/BufferedPort.h>
 #include <yarp/sig/Sound.h>
 #include <yarp/sig/SoundFilters.h>
+#include <yarp/sig/SoundFile.h>
 
 #include "api/scoped_refptr.h"
 #include "modules/audio_processing/include/audio_processing.h"
 #include <deque>
 
 #include "referenceReader.hpp"
-#include "delayEstimator.hpp"
 
 class AECComponent : public yarp::os::RFModule,
                      public yarp::os::TypedReaderCallback<yarp::sig::Sound>
@@ -69,9 +69,13 @@ private:
     void processingThreadFunction();
     bool initializeAEC(int sample_rate, int num_channels);
     bool saveAudioBlockToDisk(const std::vector<short> &samples,
+                                std::vector<bool> &markerIndices,
                               const std::string &streamName,
-                              std::size_t sequence);
+                              std::size_t &sequence,
+                              bool flushRemainder = false);
+                              
     void flushAudioSaveBuffer(std::vector<short> &buffer,
+                            std::vector<bool> &markerIndices,
                               const std::string &streamName,
                               std::size_t &sequence,
                               bool flushRemainder = false);
@@ -85,6 +89,9 @@ private:
     bool m_saveIterativeAudioToDisk;
     int m_audioSaveMaxSeconds;
     double m_referenceBufferSeconds;
+    std::vector<bool> m_micMarkerIndices;
+    std::vector<bool> m_refMarkerIndices;
+    std::vector<bool> m_outMarkerIndices;
     std::string m_audioSaveDirectory;
     std::string m_audioSavePrefix;
     std::size_t m_audioSaveSequence;
@@ -95,11 +102,10 @@ private:
     bool m_aecMobileMode;
     int m_aecStreamDelayMs;
     bool m_logAecStats;
-    int m_lastEstimatedDelayIndex{-1};
     std::chrono::steady_clock::time_point m_lastAecStatsLog;
 
     ReferenceReader m_referenceReader;
-    DelayEstimator m_delayEstimator;
+
 
 
 };
