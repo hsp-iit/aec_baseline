@@ -98,10 +98,13 @@ Edit `aec_config.ini` to customize:
 - **sample_rate**: Audio sample rate (Hz) - default 48000
 - **num_channels**: Number of channels - default 1 (mono)
 - **block_ms**: Processing block size in milliseconds - default 10
-- **saveIterativeAudioToDisk**: Save each emitted output block as a separate WAV file - default false
+- **saveIterativeAudioToDisk**: Concatenate consecutive filtered, original microphone, and reference chunks into duration-limited WAV files - default false
 - **audioSaveMaxSeconds**: Maximum duration per saved WAV file - default 30
 - **audioSaveDirectory**: Directory where WAV files are written - default `./aec-recordings`
 - **audioSavePrefix**: Prefix used for generated WAV filenames - default `aec_output`
+
+Recorded files are named `<prefix>_filtered_NNNNNN.wav`,
+`<prefix>_microphone_NNNNNN.wav`, and `<prefix>_reference_NNNNNN.wav`.
 - **aec_mobile_mode**: Enables WebRTC mobile AEC mode (can improve aggressive echo suppression) - default false
 - **aec_stream_delay_ms**: Estimated render-to-capture delay used by AEC alignment - default 120
 - **logAecStats**: Print 1 Hz AEC activity stats (with/without reference frames) - default true

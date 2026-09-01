@@ -19,6 +19,8 @@ ReferenceReader::ReferenceReader(const std::string &portName)
       m_running(false),
       m_shouldExit(false)
 {
+    m_slidingWindowIndex = 0;
+    m_audioPlayerDelayMs = 0.0f;
 }
 
 ReferenceReader::~ReferenceReader()
@@ -48,6 +50,12 @@ bool ReferenceReader::open(const std::string &portName)
         return false;
     }
 
+    if (!m_statusPort.open("/aecComponent/audioPlayerStatus:i"))
+    {
+        yError() << "[ReferenceReader::open] Unable to open status port: /aecComponent/audioPlayerStatus:i";
+        return false;
+    }
+
     // Start a dedicated blocking reader thread so incoming data is queued.
     m_readerThread = std::thread(&ReferenceReader::readerThreadFunction, this);
     m_running = true;
@@ -71,23 +79,6 @@ void ReferenceReader::close()
     m_running = false;
 }
 
-bool ReferenceReader::tryPopBlock(std::vector<short> &samples, int &sampleRate)
-{
-    // Drain one queued block in FIFO order.
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_queue.empty())
-    {
-        return false;
-    }
-
-    ReferenceBlock block = std::move(m_queue.front());
-    m_queue.pop_front();
-
-    samples = std::move(block.samples);
-    sampleRate = block.sampleRate;
-    return true;
-}
-
 bool ReferenceReader::isRunning() const
 {
     // Expose the thread state without taking the mutex.
@@ -109,12 +100,17 @@ std::string ReferenceReader::portName() const
 
 void ReferenceReader::readerThreadFunction()
 {
-    // Block on the YARP port and enqueue every sound block that arrives.
     while (!m_shouldExit)
     {
+        // Block on the YARP port and enqueue every sound block that arrives.
+
         yarp::sig::Sound *sound = m_referencePort.read(true);
 
-        yInfo() << "[ReferenceReader::readerThreadFunction] Received reference block with" << (sound ? sound->getSamples() : 0) << "samples at" << (sound ? sound->getFrequency() : 0) << "Hz";
+        yInfo() << "[ReferenceReader::readerThreadFunction] Received reference block with"
+                << (sound ? sound->getSamples() : 0)
+                << "samples at"
+                << (sound ? sound->getFrequency() : 0)
+                << "Hz";
 
         if (!sound)
         {
@@ -125,120 +121,283 @@ void ReferenceReader::readerThreadFunction()
             continue;
         }
 
-        enqueueBlock(*sound);
+        auto now = std::chrono::system_clock::now();
+
+        double soundSeconds = static_cast<double>(sound->getSamples()) / sound->getFrequency();
+
+        // std::chrono::seconds soundSeconds = std::chrono::seconds(static_cast<int>(sound->getSamples()) / sound->getFrequency());
+        // record in a variable called soundTTL the time when the sound will be considered expired, which is now + soundSeconds if 
+        // the sound list is empty, or the last timestamp in the queue + soundSeconds if the sound list is not empty
+        std::chrono::time_point<std::chrono::system_clock> soundTTL;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_timestamps.empty())
+            {
+                soundTTL = now + std::chrono::milliseconds(static_cast<int>(soundSeconds * 1000));
+            }
+            else
+            {
+                soundTTL = m_timestamps.back() + std::chrono::milliseconds(static_cast<int>(soundSeconds * 1000));
+            }
+        }
+
+        // auto now = std::chrono::system_clock::now();
+
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now.time_since_epoch())
+                          .count();
+
+        auto ttl_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          soundTTL.time_since_epoch())
+                          .count();
+
+        yInfo() << "[ReferenceReader::readerThreadFunction] Current time:"
+                << now_ms << "ms since epoch";
+
+        yInfo() << "[ReferenceReader::readerThreadFunction] Sound duration:"
+                << soundSeconds << "seconds";
+
+        yInfo() << "[ReferenceReader::readerThreadFunction] Sound TTL:"
+                << ttl_ms << "ms since epoch";
+
+        yInfo() << "[ReferenceReader::readerThreadFunction] Enqueued reference block with" << sound->getSamples() << "samples at" << sound->getFrequency() << "Hz";
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_queue.push_back(*sound);
+            m_timestamps.push_back(soundTTL);
+        }
+
+        yInfo() << "[ReferenceReader::readerThreadFunction] Added reference block to queue. Queue size is now" << m_queue.size();
     }
-}
-
-void ReferenceReader::enqueueBlock(const yarp::sig::Sound &sound)
-{
-    std::vector<short> inputSamples;
-    inputSamples.reserve(static_cast<std::size_t>(sound.getSamples()));
-    for (int index = 0; index < static_cast<int>(sound.getSamples()); ++index)
-    {
-        inputSamples.push_back(sound.get(index, 0));
-    }
-
-    // Keep the incoming block at its native rate so the component thread can
-    // align it to the microphone stream in real time.
-    ReferenceBlock block;
-    block.sampleRate = sound.getFrequency();
-    const int sampleCount = static_cast<int>(inputSamples.size());
-    block.samples.reserve(std::max(0, sampleCount));
-
-    for (int index = 0; index < sampleCount; ++index)
-    {
-        block.samples.push_back(inputSamples[index]);
-    }
-
-    yInfo() << "[ReferenceReader::enqueueBlock] Enqueued reference block with" << block.samples.size() << "samples at" << block.sampleRate << "Hz";
-
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_queue.push_back(std::move(block));
-
-    yInfo() << "[ReferenceReader::enqueueBlock] Added reference block to queue. Queue size is now" << m_queue.size();
-}
-
-yarp::sig::Sound ReferenceReader::getReferenceBlock(int index, int size)
-{
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (index < 0 || size <= 0)
-    {
-        return yarp::sig::Sound();
-    }
-
-    std::vector<short> allSamples;
-    for (const ReferenceBlock &block : m_queue)
-    {
-        allSamples.insert(allSamples.end(), block.samples.begin(), block.samples.end());
-    }
-
-    if (index >= static_cast<int>(allSamples.size()))
-    {
-        return yarp::sig::Sound();
-    }
-
-    const int endIndex = std::min(index + size, static_cast<int>(allSamples.size()));
-    std::vector<short> refBlock(allSamples.begin() + index, allSamples.begin() + endIndex);
-
-    yarp::sig::Sound sound;
-    sound.resize(refBlock.size(), 1);
-    for (int i = 0; i < static_cast<int>(refBlock.size()); ++i)
-    {
-        sound.set(refBlock[i], i, 0);
-    }
-    sound.setFrequency(m_queue.empty() ? 0 : m_queue.back().sampleRate);
-    return sound;
 }
 
 yarp::sig::Sound ReferenceReader::getRecordedReferenceBlocks()
 {
-    // Concatenate all queued reference blocks into one Sound.
-    std::vector<ReferenceBlock> blocks;
+    // auto now = std::chrono::system_clock::now();
+    // // remove stale reference blocks from the queue before returning the first one
+    // deleteStaleReferenceBlocks();
+    if (m_queue.empty())
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        blocks = std::vector<ReferenceBlock>(m_queue.begin(), m_queue.end());
+        yInfo() << "[ReferenceReader::getRecordedReferenceBlocks] Reference queue is empty, returning empty Sound";
+        return yarp::sig::Sound();
     }
 
-    int totalSamples = 0;
-    int sampleRate = 0;
-    for (const ReferenceBlock &block : blocks)
+    if (!isPlayerActive())
     {
-        totalSamples += static_cast<int>(block.samples.size());
-        if (sampleRate <= 0 && block.sampleRate > 0)
+        yInfo() << "[ReferenceReader::getRecordedReferenceBlocks] Audio player is not active, returning empty Sound";
+        return yarp::sig::Sound();
+    }
+
+    if (m_queue.front().getSamples() <= m_slidingWindowIndex)
+    {
+        m_slidingWindowIndex = 0;
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // m_timestamps.erase(m_timestamps.begin(), m_timestamps.begin() + maxIndex + 1);
+        // m_queue.erase(m_queue.begin(), m_queue.begin() + maxIndex + 1);
+        // remove the first element of the m_queue
+        m_queue.pop_front();
+        m_timestamps.pop_front();
+        yInfo() << "[ReferenceReader::getRecordedReferenceBlocks] Removed first reference block from queue due to sliding window index exceeding its size. Queue size is now" << m_queue.size();
+
+    }
+    
+
+    // Return the first audio in the queue that has a valid timestamp, or an empty Sound if the queue is empty.
+    std::deque<yarp::sig::Sound> blocks;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        blocks = std::deque<yarp::sig::Sound>(m_queue.begin(), m_queue.end());
+    }
+
+    // return a neighborhood of the first block in the queue that has a valid timestamp, or an empty Sound if the queue is empty
+    // Note: the first block is the oldest one in the queue, having a timestamp that is less than or equal to the current time.
+    // this means that ideally it has not been completely consumed yet, and may be still be played by the audio player
+    yarp::sig::Sound blockNeighborhood;
+    yarp::sig::Sound firstBlock;
+    if (!blocks.empty())
+    {
+        firstBlock = blocks.front();
+        int soundFrequency = firstBlock.getFrequency();
+        // // compute the time passed since the first block was recorded, and compute how many samples have not been consumed yet, and return a neighborhood of the first block that has a valid timestamp, starting from the sample that has not been consumed yet
+        
+        // auto firstBlockTimestamp = m_timestamps.front();
+        // auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(firstBlockTimestamp - now).count();
+
+        // int consumedSamples = static_cast<int>(firstBlock.getSamples()) - static_cast<int>(remaining_ms * soundFrequency / 1000);
+
+        // use consumedSamples to get a neighborhood of size 8000 samples at 16000 Hz from the first block, starting from the sample that has not been consumed yet. If the block has sound frequency different than 16000 Hz, scale the neighborhood size accordingly. If the block has less than 8000 samples remaining, return all remaining samples.
+        int neighborhoodSize = static_cast<int>(4000 * soundFrequency / 16000);
+        // int startSample = std::max(0, static_cast<int>(consumedSamples));
+        int startSample = m_slidingWindowIndex;
+
+        // yInfo() << "[ReferenceReader::getRecordedReferenceBlocks] First block has" << firstBlock.getSamples() << "samples at" << soundFrequency << "Hz, consumed samples:" << consumedSamples << ", neighborhood size:" << neighborhoodSize << ", start sample:" << startSample;
+        yInfo() << "[ReferenceReader::getRecordedReferenceBlocks] First block has" << firstBlock.getSamples() << "samples at" << soundFrequency << "Hz, neighborhood size:" << neighborhoodSize << ", start sample:" << startSample;
+        int endSample = std::min(static_cast<int>(firstBlock.getSamples()), startSample + neighborhoodSize);
+        m_slidingWindowIndex += endSample - startSample;
+
+        blockNeighborhood.resize(endSample - startSample, firstBlock.getChannels());
+        blockNeighborhood.setFrequency(soundFrequency);
+        for (int i = startSample; i < endSample; ++i)
         {
-            sampleRate = block.sampleRate;
+            for (int j = 0; j < firstBlock.getChannels(); ++j)
+            {
+                blockNeighborhood.set(firstBlock.get(i, j), i - startSample, j);
+            }
+        }
+
+        if (static_cast<int>(blockNeighborhood.getSamples()) < neighborhoodSize)
+        {
+            int samplesToAppend = neighborhoodSize - static_cast<int>(blockNeighborhood.getSamples());
+            yInfo() << "[ReferenceReader::getRecordedReferenceBlocks] Block neighborhood has less than" << neighborhoodSize << "samples, attempting to append next block in queue if it exists";
+            if (blocks.size() > 1)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    // populate nextBlock with the first samplesToAppend samples of the second block in the queue, starting from sample 0
+                    yarp::sig::Sound nextBlock = blocks.at(1).subSound(0, samplesToAppend);
+                    m_queue.at(1) = blocks.at(1).subSound(samplesToAppend, blocks.at(1).getSamples());
+                }
+                blockNeighborhood.resize(neighborhoodSize, firstBlock.getChannels());
+                for (int i = 0; i < samplesToAppend; ++i)
+                {
+                    for (int j = 0; j < firstBlock.getChannels(); ++j)
+                    {   
+                        blockNeighborhood.set(blocks.at(1).get(i, j), static_cast<int>(blockNeighborhood.getSamples()) - samplesToAppend + i, j);
+                    }
+                }
+            }
+            else // append null samples to blockNeighborhood until it has neighborhoodSize samples
+            {
+                yInfo() << "[ReferenceReader::getRecordedReferenceBlocks] No next block in queue, appending null samples to block neighborhood";
+                int currentSamples = static_cast<int>(blockNeighborhood.getSamples());
+                blockNeighborhood.resize(neighborhoodSize, firstBlock.getChannels());
+                for (int i = currentSamples; i < neighborhoodSize; ++i)
+                {
+                    for (int j = 0; j < firstBlock.getChannels(); ++j)
+                    {
+                        blockNeighborhood.set(0, i, j);
+                    }
+                }
+            }
+        }
+
+    }
+
+    return blocks.empty() ? yarp::sig::Sound() : blockNeighborhood;
+}
+
+void ReferenceReader::deleteStaleReferenceBlocks()
+{
+
+    auto now = std::chrono::system_clock::now();
+    int maxIndex = -1;
+
+    // find the index of the last timestamp that is less than or equal to the current time, and remove all timestamps and corresponding audio blocks before that index
+    for (std::size_t i = 0; i < m_timestamps.size(); ++i)
+    {
+        const auto &timestamp = m_timestamps[i];
+
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now.time_since_epoch())
+                          .count();
+
+        auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         timestamp.time_since_epoch())
+                         .count();
+
+        auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                timestamp - now)
+                                .count();
+
+        yInfo() << "[ReferenceReader] now =" << now_ms << "ms,"
+                << "timestamp =" << ts_ms << "ms,"
+                << "remaining =" << remaining_ms << "ms";
+
+        if (now > timestamp)
+        {
+            maxIndex = static_cast<int>(i);
+            yInfo() << "[ReferenceReader] Timestamp at index" << i << "has expired";
+            m_slidingWindowIndex = 0;
+        }
+        else
+        {
+            yInfo() << "[ReferenceReader] First element still valid.";
+            break;
         }
     }
 
-    yarp::sig::Sound sound;
-    sound.resize(totalSamples, 1);
-    int sampleIndex = 0;
-    for (const ReferenceBlock &block : blocks)
+    if (maxIndex >= 0)
     {
-        for (short sample : block.samples)
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_timestamps.erase(m_timestamps.begin(), m_timestamps.begin() + maxIndex + 1);
+        m_queue.erase(m_queue.begin(), m_queue.begin() + maxIndex + 1);
+        yInfo() << "[ReferenceReader] Removed" << (maxIndex + 1) << "expired reference blocks from queue. Queue size is now" << m_queue.size();
+    }
+}
+
+// void ReferenceReader::updateSlidingWindowIndex(int index)
+// {   
+//     yInfo() << "[ReferenceReader::updateSlidingWindowIndex] Updating sliding window index by" << index << "samples. Previous index:" << m_slidingWindowIndex;
+//     std::lock_guard<std::mutex> lock(m_mutex);
+//     m_slidingWindowIndex = m_slidingWindowIndex + index;
+//     yInfo() << "[ReferenceReader::updateSlidingWindowIndex] New sliding window index:" << m_slidingWindowIndex;
+// }
+
+bool ReferenceReader::isPlayerActive()
+{
+    yarp::sig::AudioPlayerStatus *status = m_statusPort.read(false);
+    // yInfo() << "[ReferenceReader::isPlayerActive] Checking audio player status: " << (status ->current_buffer_size) << "elements in buffer";
+    if (status && status->current_buffer_size > 0)
+    {
+        // std::string statusStr = status->get(0).asString();
+        int firstBlockSize = 0;
+        yInfo() << "[ReferenceReader::isPlayerActive] Received audio player status with" << status->current_buffer_size << "elements, assuming active";
         {
-            if (sampleIndex < totalSamples)
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_queue.empty())
             {
-                sound.set(sampleIndex, 0, sample);
-                ++sampleIndex;
+                firstBlockSize = m_queue.front().getSamples();
+                yInfo() << "[ReferenceReader::isPlayerActive] First reference block in queue has" << firstBlockSize << "samples";
             }
             else
             {
-                break;
+                firstBlockSize = 0;
+                yInfo() << "[ReferenceReader::isPlayerActive] Reference queue is empty";
             }
         }
+
+        int audioPlayerDelaySamples = firstBlockSize - static_cast<int>(status->current_buffer_size) - static_cast<int>(m_slidingWindowIndex);
+        if (audioPlayerDelaySamples > 0)
+        {
+            m_audioPlayerDelayMs = static_cast<float>(audioPlayerDelaySamples) * 1000.0f / 24000.0f; // Assuming 24kHz sample rate for delay calculation
+        }
+
+        return true;
     }
-    sound.setFrequency(sampleRate);
-    return sound;
+    else
+    {
+        yInfo() << "[ReferenceReader::isPlayerActive] No audio player status received, assuming inactive";
+        if (m_slidingWindowIndex > 0) 
+        {
+            yInfo() << "[ReferenceReader::isPlayerActive] Resetting sliding window index to 0";
+            yInfo() << "[ReferenceReader::isPlayerActive] Removing samples from queue:" << m_slidingWindowIndex;
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_slidingWindowIndex = 0;
+            if (!m_queue.empty())
+            {
+                m_queue.pop_front();
+                m_timestamps.pop_front();
+                yInfo() << "[ReferenceReader::isPlayerActive] Removed first reference block from queue. Queue size is now" << m_queue.size();
+            }
+        }
+        return false;
+    }
 }
 
-void ReferenceReader::flushStaledBlocks(int index)
+
+float ReferenceReader::getLastEstimatedAudioPlayerDelay()
 {
-    // Flush staled blocks from the queue based on a provided index, which can be used to discard old reference blocks that are no longer relevant for delay estimation.
-    std::lock_guard<std::mutex> lock(m_mutex);
-    while (!m_queue.empty() && index > 0)
-    {
-        m_queue.pop_front();
-        --index;
-    }
+    return m_audioPlayerDelayMs;
 }

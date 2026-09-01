@@ -71,8 +71,6 @@ add_executable(aecComponent
     aec_main.cpp
     referenceReader.hpp
     referenceReader.cpp
-    delayEstimator.hpp
-    delayEstimator.cpp
 )
 
 add_executable(microphoneRecorder

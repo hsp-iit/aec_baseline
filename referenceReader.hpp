@@ -17,9 +17,11 @@
 #include <thread>
 #include <vector>
 #include <cmath>
+#include <chrono>
 
 #include <yarp/os/BufferedPort.h>
 #include <yarp/sig/Sound.h>
+#include <yarp/sig/AudioPlayerStatus.h>
 
 class ReferenceReader
 {
@@ -42,35 +44,38 @@ public:
     bool isRunning() const;
     // Return the number of queued audio blocks waiting to be consumed.
     std::size_t queuedBlocks() const;
-    // Pop one queued block if available and return its samples and sample rate.
-    bool tryPopBlock(std::vector<short> &samples, int &sampleRate);
     // Return the currently configured YARP port name.
     std::string portName() const;
+    // Delete staled reference blocks from the queue based on the duration of the audio block
+    void deleteStaleReferenceBlocks();
 
-    // concurrent-safe method to flush staled blocks from the queue based on a provided index, which can be used to discard old reference blocks that are no longer relevant for delay estimation.
-    void flushStaledBlocks(int index);
+    // Update the index of the sliding window.
+    // void updateSlidingWindowIndex(int index);
 
-    yarp::sig::Sound getReferenceBlock(int index, int size);
+    bool isPlayerActive();
 
     yarp::sig::Sound getRecordedReferenceBlocks();
 
+    float getLastEstimatedAudioPlayerDelay();
+
 private:
-    struct ReferenceBlock
-    {
-        std::vector<short> samples;
-        int sampleRate = 0;
-    };
 
     void readerThreadFunction();
-    void enqueueBlock(const yarp::sig::Sound &sound);
 
     std::string m_portName;
     yarp::os::BufferedPort<yarp::sig::Sound> m_referencePort;
     std::thread m_readerThread;
     mutable std::mutex m_mutex;
-    std::deque<ReferenceBlock> m_queue;
+    std::deque<std::chrono::time_point<std::chrono::system_clock>> m_timestamps;
+    std::deque<yarp::sig::Sound> m_queue;
     std::atomic<bool> m_running;
     std::atomic<bool> m_shouldExit;
+
+    yarp::os::BufferedPort<yarp::sig::AudioPlayerStatus> m_statusPort;
+
+    float m_audioPlayerDelayMs;
+
+    int m_slidingWindowIndex;
 };
 
 #endif // REFERENCE_READER__HPP
