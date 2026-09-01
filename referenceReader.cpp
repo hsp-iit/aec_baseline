@@ -247,6 +247,42 @@ yarp::sig::Sound ReferenceReader::getRecordedReferenceBlocks()
             }
         }
 
+        if (static_cast<int>(blockNeighborhood.getSamples()) < neighborhoodSize)
+        {
+            int samplesToAppend = neighborhoodSize - static_cast<int>(blockNeighborhood.getSamples());
+            yInfo() << "[ReferenceReader::getRecordedReferenceBlocks] Block neighborhood has less than" << neighborhoodSize << "samples, attempting to append next block in queue if it exists";
+            if (blocks.size() > 1)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    // populate nextBlock with the first samplesToAppend samples of the second block in the queue, starting from sample 0
+                    yarp::sig::Sound nextBlock = blocks.at(1).subSound(0, samplesToAppend);
+                    m_queue.at(1) = blocks.at(1).subSound(samplesToAppend, blocks.at(1).getSamples());
+                }
+                blockNeighborhood.resize(neighborhoodSize, firstBlock.getChannels());
+                for (int i = 0; i < samplesToAppend; ++i)
+                {
+                    for (int j = 0; j < firstBlock.getChannels(); ++j)
+                    {   
+                        blockNeighborhood.set(blocks.at(1).get(i, j), static_cast<int>(blockNeighborhood.getSamples()) - samplesToAppend + i, j);
+                    }
+                }
+            }
+            else // append null samples to blockNeighborhood until it has neighborhoodSize samples
+            {
+                yInfo() << "[ReferenceReader::getRecordedReferenceBlocks] No next block in queue, appending null samples to block neighborhood";
+                int currentSamples = static_cast<int>(blockNeighborhood.getSamples());
+                blockNeighborhood.resize(neighborhoodSize, firstBlock.getChannels());
+                for (int i = currentSamples; i < neighborhoodSize; ++i)
+                {
+                    for (int j = 0; j < firstBlock.getChannels(); ++j)
+                    {
+                        blockNeighborhood.set(0, i, j);
+                    }
+                }
+            }
+        }
+
     }
 
     return blocks.empty() ? yarp::sig::Sound() : blockNeighborhood;

@@ -402,6 +402,10 @@ void AECComponent::processingThreadFunction()
 
         const int frame_samples = std::max(1, static_cast<int>((m_sample_rate * m_block_ms) / 1000));
 
+        m_apm->set_stream_delay_ms(m_referenceReader.getLastEstimatedAudioPlayerDelay());
+
+        yInfo() << "[AECComponent::processingThread] Set AEC stream delay to" << m_referenceReader.getLastEstimatedAudioPlayerDelay() << "ms";
+
         for (int i = 0; i < static_cast<int>(m_micBuffer.size() / frame_samples); ++i)
         {
             std::vector<short> mic_frame;
@@ -415,9 +419,7 @@ void AECComponent::processingThreadFunction()
 
             try
             {
-                // m_apm->set_stream_delay_ms(200); // Set the stream delay to 120ms, adjust as needed
-                m_apm->set_stream_delay_ms(m_referenceReader.getLastEstimatedAudioPlayerDelay());
-                yInfo() << "[AECComponent::processingThread] Set AEC stream delay to" << m_referenceReader.getLastEstimatedAudioPlayerDelay() << "ms";
+                
                 m_apm->ProcessReverseStream(ref_frame.data(), *m_streamConfig, *m_streamConfig, ref_frame.data());
                 m_apm->ProcessStream(mic_frame.data(), *m_streamConfig, *m_streamConfig, mic_frame.data());
 
