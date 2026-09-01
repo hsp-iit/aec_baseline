@@ -88,7 +88,6 @@ private:
     int m_block_ms;
     bool m_saveIterativeAudioToDisk;
     int m_audioSaveMaxSeconds;
-    double m_referenceBufferSeconds;
     std::vector<bool> m_micMarkerIndices;
     std::vector<bool> m_refMarkerIndices;
     std::vector<bool> m_outMarkerIndices;
@@ -105,9 +104,7 @@ private:
     std::chrono::steady_clock::time_point m_lastAecStatsLog;
 
     ReferenceReader m_referenceReader;
-
-
-
+    
 };
 
 #endif // AEC_COMPONENT__HPP
